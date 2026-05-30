@@ -1,5 +1,6 @@
 #include "arch/mod.h"
 #include "lib/mod.h"
+#include "mem/mod.h"
 
 volatile static int started = 0;
 
@@ -17,7 +18,7 @@ int main()
         while(started == 0)
             ;
         
-        __sync_synchronize(); //保证初始化完成
+        __sync_synchronize();
 
         printf("cpu %d is booting!\n", cpuid);
     }
