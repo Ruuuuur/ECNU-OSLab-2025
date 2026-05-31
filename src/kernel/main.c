@@ -9,8 +9,12 @@ int main()
     int cpuid = r_tp();
     if(cpuid == 0){
         print_init();
-        printf("cpu %d is booting!\n", cpuid);
+        pmem_init();
+        kvm_init();
+        kvm_inithart();
 
+        printf("cpu %d is booting!\n", cpuid);
+        
         __sync_synchronize();
 
         started = 1;
@@ -19,6 +23,7 @@ int main()
             ;
         
         __sync_synchronize();
+        kvm_inithart();
 
         printf("cpu %d is booting!\n", cpuid);
     }
@@ -26,3 +31,4 @@ int main()
     while(1)
         ;
 }
+
