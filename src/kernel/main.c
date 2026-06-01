@@ -1,6 +1,7 @@
 #include "arch/mod.h"
 #include "lib/mod.h"
 #include "mem/mod.h"
+#include "trap/mod.h"
 
 volatile static int started = 0;
 
@@ -14,14 +15,14 @@ int main()
         kvm_inithart();
 
         printf("cpu %d is booting!\n", cpuid);
-        
+
         __sync_synchronize();
 
         started = 1;
     }else{
         while(started == 0)
             ;
-        
+
         __sync_synchronize();
         kvm_inithart();
 
@@ -31,4 +32,3 @@ int main()
     while(1)
         ;
 }
-

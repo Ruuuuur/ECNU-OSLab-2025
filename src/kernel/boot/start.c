@@ -1,4 +1,5 @@
 #include "../arch/mod.h"
+#include "../trap/mod.h"
 
 // 每个CPU在运行操作系统时需要一个初始的函数栈
 __attribute__((aligned(16))) uint8 CPU_stack[4096 * NCPU];
@@ -14,6 +15,10 @@ void start()
     // 所以需要将hartid存到可访问的寄存器tp
     int id = r_mhartid();
     w_tp(id);
+
+    // 委托S-mode处理trap，时钟中断仍先由M-mode处理
+
+    // 时钟中断初始化 (唯一需要在M-mode处理的中断)
 
     // 修改mstatus寄存器，假装上一个状态是S-mode
     uint64 status = r_mstatus();

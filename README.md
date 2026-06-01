@@ -1,171 +1,260 @@
-# LAB-2: 内存管理初步
+# LAB-3: 中断异常初步
 
-本次实验在 LAB-1 的机器启动、UART 输出和自旋锁基础上，实现了物理页管理和内核态虚拟内存管理。完成后，内核可以初始化物理页分配器，建立内核页表，开启 SV39 地址翻译，并通过测试验证物理页分配、释放、页表映射和解除映射的正确性。
+**前言**
 
-## 实现内容
+前两个实验其实留了两个坑没有填:
 
-本次实验主要完成了以下函数：
+- lab-1中实现了UART的输入输出函数, 但是printf只用到输出函数, 输入函数没有发挥作用
 
-- `pmem_init()`：初始化内核区和用户区的物理页空闲链表
-- `pmem_alloc()`：从指定区域申请一个清零后的 4KB 物理页
-- `pmem_free()`：释放一个物理页并重新插入空闲链表
-- `vm_getpte()`：根据虚拟地址在三级页表中查找或创建 PTE
-- `vm_mappages()`：建立虚拟地址到物理地址的页表映射
-- `vm_unmappages()`：解除指定虚拟地址范围的页表映射
-- `kvm_init()`：建立内核页表，映射 UART、CLINT、PLIC 和物理内存
+- lab-2中内核页表映射了CLINT和PLIC这两种设备, 还没有使用过它们的能力
 
-## 物理内存
+在本次实验, 我们会填上这两个小坑——为OS内核引入初级的“中断+异常”的识别和处理能力
 
-物理内存的可分配区域由 `kernel.ld` 提供：
-
-```text
-ALLOC_BEGIN ~ ALLOC_END
+## 代码组织结构
 ```
-
-实验中将这段空间划分为两个区域：
-
-```text
-kernel region: [ALLOC_BEGIN, ALLOC_BEGIN + KERN_PAGES * PGSIZE)
-user region:   [ALLOC_BEGIN + KERN_PAGES * PGSIZE, ALLOC_END)
+ECNU-OSLAB-2025-TASK
+├── LICENSE        开源协议
+├── .vscode        配置了可视化调试环境
+├── registers.xml  配置了可视化调试环境
+├── common.mk      Makefile中一些工具链的定义
+├── Makefile       编译运行整个项目
+├── kernel.ld      定义了内核程序在链接时的布局
+├── pictures       README使用的图片目录 (CHANGE, 日常更新)
+├── README.md      实验指导书 (CHANGE, 日常更新)
+└── src            源码
+    └── kernel     内核源码
+        ├── arch   RISC-V相关
+        │   ├── method.h
+        │   ├── mod.h
+        │   └── type.h (CHANGE, 新增一些RISC-V中断相关宏定义)
+        ├── boot   机器启动
+        │   ├── entry.S
+        │   └── start.c (TODO, 在M-mode多做一些事情再进入S-mode)
+        ├── lock   锁机制
+        │   ├── spinlock.c
+        │   ├── method.h
+        │   ├── mod.h
+        │   └── type.h
+        ├── lib    常用库
+        │   ├── cpu.c
+        │   ├── print.c
+        │   ├── uart.c
+        │   ├── utils.c
+        │   ├── method.h
+        │   ├── mod.h
+        │   └── type.h
+        ├── mem    内存模块
+        │   ├── pmem.c
+        │   ├── kvm.c
+        │   ├── method.h
+        │   ├── mod.h
+        │   └── type.h
+        ├── trap   陷阱模块
+        │   ├── plic.c (NEW, 请阅读和理解这部分)
+        │   ├── timer.c (TODO, 时钟中断和计时器相关操作)
+        │   ├── trap_kernel.c (TODO, 内核态trap处理的核心逻辑)
+        │   ├── trap.S (NEW, 很重要, 请完全理解这部分)
+        │   ├── method.h (CHANGE)
+        │   ├── mod.h
+        │   └── type.h (CHANGE)
+        └── main.c (TODO, 更多的初始化)
 ```
+**标记说明**
 
-每个区域由一个 `alloc_region_t` 描述：
+**NEW**: 新增源文件, 直接拷贝即可, 无需修改
 
-```c
-typedef struct alloc_region
-{
-    uint64 begin;
-    uint64 end;
-    spinlock_t lk;
-    uint32 allocable;
-    page_node_t list_head;
-} alloc_region_t;
-```
+**CHANGE**: 旧的源文件发生了更新, 直接拷贝即可, 无需修改
 
-空闲页通过单链表管理。初始化时将每个 4KB 页转换成 `page_node_t` 插入空闲链表；分配时从链表头取出一页；释放时清零后重新头插回链表。由于物理内存是共享资源，对链表和 `allocable` 的访问使用自旋锁保护。
+**TODO**: 你需要实现新功能 / 你需要完善旧功能
 
-## 虚拟内存
+## 初步认识中断和异常
 
-内核使用 RISC-V SV39 三级页表。虚拟地址通过三级 VPN 查找最终的叶子 PTE：
+中断、异常、陷入等概念在不同体系结构下(ARM, x86, MIPS...)定义有一些区别, 这里只讨论RISC-V的定义
 
-```text
-level-2 -> level-1 -> level-0 -> physical page
-```
+RISC-V用陷阱(trap)的概念统筹二者: 陷阱可以分为中断(interrupt)和异常(exception)两种类型
 
-`vm_getpte()` 从顶级页表开始，根据 `VA_TO_VPN(va, level)` 逐级查找。如果中间页表不存在且 `alloc == true`，则申请新的物理页作为下一级页表。
+**共同点:**
 
-`vm_mappages()` 负责为 `[va, va + len)` 建立映射。即使 `len` 不是整页大小，只要覆盖到某个页面，就会为该页建立 PTE。
+- 中断和异常都是对正常执行流的一种打断, OS内核临时处理一个紧急的事情, 随后返回原来的执行流
 
-`vm_unmappages()` 负责解除 `[va, va + len)` 内的叶子 PTE。如果 `freeit == true`，同时释放对应的用户物理页。
+- 中断和异常都涉及特权级的陷入和返回, 例如U-mode陷入S-mode再返回U-mode (也可以是同级的)
 
-`kvm_init()` 建立内核页表，采用直接映射：
+**不同点:**
 
-```text
-VA == PA
-```
+- 中断是同步过程, 假设发生中断的指令地址为PC, 中断处理完成后, 会继续执行PC+4对应的指令 (下一条指令)
 
-映射内容包括：
+- 异常是异步过程, 假设发生异常的指令地址为PC, 异常处理完成后, 会重新执行PC对应的指令
 
-- UART 寄存器区域
-- CLINT 寄存器区域
-- PLIC 寄存器区域
-- 内核代码段，权限为 `PTE_R | PTE_X`
-- 内核数据和可分配内存区域，权限为 `PTE_R | PTE_W`
+**从程序的角度来看:**
 
-## 测试结果
+- 遇到**中断**往往是意料之内的事, 甚至是期待发生的事 (需要串口中断读取字符, 需要时钟中断指导调度)
 
-### 物理页并行分配与释放
+- 遇到**异常**往往是因为代码本身有问题 (除了ecall和page fault这两种可控的情况)
 
-测试目标：两个 CPU 并行申请内核区域的物理页，写入数据，随后并行释放，验证物理页分配器在多核环境下能正常工作。
+**具体来说, RISC-V定义了以下中断和异常类型:**
 
-测试要点：
+- RISC-V为三个特权级 (U-mode, S-mode, M-mode) 分别定义了三种中断 (时钟中断, 软件中断, 外设中断)
 
-- CPU 0 和 CPU 1 分别申请 512 个内核物理页
-- 每个页面写入数据并打印地址和值
-- 两个 CPU 都完成分配后，再分别释放自己申请的页面
-- 测试过程中没有触发 panic，说明空闲链表和锁机制工作正常
+- RISC-V定义了十几种异常类型 (包括内存读取带来的越界, 内存写入带来的越界, 非法指令, ecall等)
 
-运行结果：
+![pic](./pictures/01.png)
 
-![物理页并行分配与释放](pictures/test1-1.png)
+**关于CLINT和PLIC:**
 
-### 常规申请、释放与清零验证
+- CLINT (core-local interruptor) 是每个CPU都有的机制, 负责接收**时钟中断和软件中断**
 
-测试目标：验证用户物理页的常规申请和释放，以及释放后的页面是否会被清零。
+- PLIC (platform-level interrupt controller) 是所有CPU共享的机制, 负责接收**外设中断**
 
-测试要点：
+本次实验我们主要实现串口中断(一种外设中断)和时钟中断
 
-- 连续申请 `TEST_CNT` 个用户页
-- 检查申请地址是否位于用户区范围内
-- 检查申请后 `allocable` 数量是否减少
-- 释放这些用户页
-- 检查释放后 `allocable` 数量是否恢复
-- 再次申请页面，确认页面内容已被清零
+## 串口中断
 
-运行结果：
+**任务清单:**
 
-![常规申请释放测试](pictures/test1-2.2.png)
+1. 由于OS内核主要运行在S-mode, 需要在start函数进入main函数之前, 将trap响应的任务"委托"给S-mode (寄存器操作)
 
-### 内存耗尽测试
+2. lab-1给了一个UART输入函数的初步版本, 你需要让它支持换行和Backspace的能力, 思考一下怎么修改
 
-测试目标：持续申请物理页直到耗尽，确认 `pmem_alloc()` 能正确触发 panic。
+3. 找到一种方法识别UART输入引发的中断信号
 
-测试方式：
+4. 在合适的地方调用完善后的`uart_intr`来处理UART中断 (只用回显字符)
 
-```c
-void test_case_1()
-{
-    while (1)
-        pmem_alloc(true);
-}
-```
+**1和2比较容易, 下面具体介绍3和4:**
 
-运行结果显示，物理页耗尽后正常触发：
+首先关注`trap_kernel_init`和`trap_kernel_inithart`, 你应该在`main`的合适位置调用它们, 完成中断相关初始化
 
-```text
-panic! pmem_alloc: out of memory
-```
+初始化过程包括: 设置各种中断的优先级、使能中断开关、设置响应阈值等, 主要在`plic_init`和`plic_inithart`中
 
-运行结果：
+`trap_kernel_inithart`还做了一个重要的工作, 将S-mode的中断入口地址设置为`kernel_vector`(in trap.S)
 
-![内存耗尽 panic 测试](pictures/test1-2.1.png)
+意味着在S-mode发生中断后, PLIC会立刻让执行流跳转到`kernel_vector`的位置
 
-### 页表映射与解除映射
+`kernel_vector`的逻辑分为四个部分 (前置知识:RISC-V规定函数栈在内存里从高地址向低地址生长):
 
-测试目标：验证 `vm_mappages()`、`vm_unmappages()` 和 `vm_print()` 的基本功能。
+- 上下文保存: 函数栈扩展以空出32*8个字节的空间, 将32个通用寄存器的状态保存到内存空间
 
-测试要点：
+- 进入核心的陷阱处理逻辑: `call trap_kernel_handler`
 
-- 为多个虚拟地址建立映射
-- 覆盖不同层级的 VPN
-- 使用不同权限组合验证 PTE flags
-- 对部分虚拟页解除映射
-- 使用 `vm_print()` 对比解除映射前后的页表结构
+- 上下文恢复: 从内存空间恢复32个通用寄存器的状态, 收缩函数栈以释放这部分内存空间
 
-运行结果中，`test-1` 显示初始映射关系，`test-2` 显示解除部分映射后的页表状态。被解除的叶子 PTE 不再显示，中间页表页仍然保留，这符合当前实验未实现页表页回收的设计。
+- 通过`sret`从陷阱处理执行流回到正常执行流
 
-运行结果：
+可以看出, 其实`kernel_vector`核心就是为了保证`trap_kernel_handler`能不受干扰地执行
 
-![页表映射与解除映射](pictures/test2-1.png)
+`trap_kernel_handler`的逻辑本质就是一个`switch-case`过程:
 
-### 映射正确性断言测试
+- 通过状态寄存器保存的信息判断trap类型 (两个大类 + N个小类)
 
-测试目标：通过断言检查 PTE 是否存在、是否有效、物理地址是否匹配、权限位是否正确，以及解除映射后 PTE 是否被清空。
+- 调用合适的处理函数来响应对应类型的trap (`external_interrupt_handler`)
 
-测试要点：
+- 如果遇到意料之外/无法处理的中断和异常, 输出报错信息并终止即可
 
-- 建立两个虚拟地址到用户物理页的映射
-- 使用 `vm_getpte()` 获取对应 PTE
-- 检查 `PTE_V`、`PTE_R`、`PTE_W` 和物理地址
-- 调用 `vm_unmappages()` 解除映射
-- 再次读取 PTE，确认 `PTE_V` 已清除
+`external_interrupt_handler` 需要利用PLIC提供的能力来判断是哪一种外设中断
 
-运行结果：
+如果发现是串口中断, 调用对应的`uart_intr`作处理
 
-![映射正确性断言测试](pictures/test2-2.png)
+**逻辑流程梳理**: 串口中断发生->`kernel_vector`前半部分->`trap_kernel_handler`->
 
-## 实验结论
+`external_interrupt_handler`->`uart_intr`->`kernel_vector`后半部分
 
-本次实验完成了物理内存管理和内核页表管理的基础功能。物理页分配器能够在多核环境下正确申请和释放页面，并在释放后清零页面内容。页表部分能够创建三级页表、建立映射、更新映射权限、解除叶子 PTE，并通过 `vm_print()` 观察页表结构变化。
+## 时钟中断
 
-最终内核可以调用 `pmem_init()`、`kvm_init()` 和 `kvm_inithart()` 后继续正常运行，说明内核直接映射页表能够支撑当前阶段的内核执行。
+时钟是计算机的核心底层机制之一, 是机器指令有序执行的"心跳"或"节拍"
+
+**RISC-V提供的时钟模型是这样的:**
+
+- **cycle**是最基本的时间单位, 不可拆分
+
+- **MTIME**寄存器存储了从内核启动到此刻的cycle数量--`C1`
+
+- **MTIMECMP**寄存器存储了一个目标的cycle数量--`C2`
+
+- 如果某个时刻`C1`和`C2`相等, 则产生一个**时钟中断信号**
+
+- 时钟中断处理过程中, **MTIMECMP**寄存器会被更新成一个更大的值, 以确保一段时间后能再次触发时钟中断
+
+- 通常来说, **MTIMECMP**寄存器的每次更新都是`C2 = C2 + INTERVAL`, 以保证规律性
+
+- 也就是说, 每隔**INTERVAL**个cycle, 产生一个时钟中断, 这个间隔被称为**tick**
+
+- 在我们的环境下, **INTERVAL**默认设置为1000000, 对应真实世界的大约0.1秒
+
+OS内核维护了一个全局的系统时钟, 它由一个ticks和自选锁组成
+
+你需要完成三个简单的操作函数: 时钟初始化, 时钟写入(ticks++), 时钟读取(返回ticks)
+
+**完成前置步骤后, 我们正式讨论时钟中断的实现:**
+
+相比串口中断, 时钟中断的一个重要区别是: 相关寄存器(**MTIME**、**MTIMECMP**等)只能在M-mode访问
+
+因此, 时钟中断处理分为M-mode部分逻辑和S-mode部分逻辑
+
+**M-mode部分:**
+
+- 在`start`进入`main`之前, 需要完成时钟初始化
+
+- 时钟初始化函数`timer_init`负责设置**MTIMECMP**寄存器的初始值、设置M-mode的trap处理入口、使能时钟中断等
+
+- 时钟中断发生后, 执行流自动跳转到**mtvec**寄存器中存放的`timer_vector`(in trap.S)
+
+- `timer_vector`与`timer_init`通过**cur_mscratch**变量完成精妙配合, 实现**MTIMECMP**寄存器的更新
+
+- 手动制造一个S-mode的软件中断, 将控制流转移到S-mode的trap处理入口`kernel_vector`
+
+- 通过`mret`从陷阱处理执行流回到正常执行流
+
+**S-mode部分:**
+
+软件中断发生->`kernel_vector`前半部分->`trap_kernel_handler`->`timer_interrupt_handler`
+
+->`timer_update` + 宣布S-mode软件中断处理完成->`kernel_vector`后半部分
+
+**时钟中断的流程图如下所示:**
+
+![pic](./pictures/02.png)
+
+## 测试用例
+
+**1. 时钟滴答测试, 在合适的地方加一行滴答输出**
+
+![pic](./pictures/03.png)
+
+**2. 时钟快慢测试, 在合适的地方加一行ticks输出**
+
+![pic](./pictures/04.png)
+
+tips: 修改**INTERVAL**, 观察ticks输出速度, 体会时钟滴答的快慢变化
+
+**3. UART输入测试, 验证是否能输入字符并回显到屏幕上(包括Backspace和换行)**
+
+![pic](./pictures/05.png)
+
+**补充更多测试用例**
+
+助教给出的测试用例是远远不够的, 你需要补充更多测试用例以保证新增代码的正确性 
+
+可以将你新增的测试用例和测试结果放在你的READM里面
+
+另外, 值得强调的一点是：学会使用`panic`和`assert`做必要的检查
+
+在出问题前输出有价值的错误信息, 比系统直接卡死或进入错误状态, 更容易Debug
+
+**尾声**
+
+通过前三个实验, 我们搭建了OS内核的基础设施 (第一阶段)
+
+- lab-1: 机器启动、标准输出、自旋锁
+
+- lab-2: 物理内存、内核态虚拟内存
+
+- lab-3: 中断和异常 (串口输入和时钟滴答)
+
+一切的准备都是为了引出OS内核世界中最重要的概念--进程 (第二阶段)
+
+- 进程需要基本的输入输出能力
+
+- 进程需要自己的内存资源和虚拟地址空间
+
+- 进程需要通过系统调用(一种异常)来获取OS内核服务
+
+**新手村任务结束了, 准备接受更大的挑战吧......**
