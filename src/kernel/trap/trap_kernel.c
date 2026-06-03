@@ -63,6 +63,7 @@ void trap_kernel_inithart()
     // 填写内核态中断处理函数
     w_stvec((uint64)kernel_vector);
 
+    w_sie(r_sie() | SIE_SEIE | SIE_SSIE);
     // 打开中断
     intr_on();
 }
@@ -87,7 +88,12 @@ void trap_kernel_handler()
         // 1-中断处理
         switch (trap_id) // 中断产生原因分类
         {
-
+        case 1:
+            timer_interrupt_handler();
+            break;
+        case 9:
+            external_interrupt_handler();
+            break;
         default: // 例外处理
             printf("\nunexpected interrupt: %s\n", interrupt_info[trap_id]);
             printf("trap_id = %d, sepc = %p, stval = %p\n", trap_id, sepc, stval);
@@ -109,7 +115,15 @@ void trap_kernel_handler()
 // 外设中断处理 (基于PLIC，lab-3只需要识别和处理UART中断)
 void external_interrupt_handler()
 {
+    int irq = plic_claim();
 
+    if(irq == UART_IRQ){
+        uart_intr();
+    }else if(irq){
+        printf("unexpected external interrupt irq = %d\n", irq);
+    }
+
+    if(irq) plic_complete(irq);
 }
 
 // 时钟中断处理 (基于CLINT)
@@ -117,8 +131,9 @@ void timer_interrupt_handler()
 {
     // 由于sys_timer是共享资源, 但每个CPU都能收到时钟中断
     // 所以只需要指定一个CPU(CPU-0)负责更新时钟
-    if(mycpuid() == 0)
+    if(mycpuid() == 0){
         timer_update();
+    }
     // 清除 SSIP bit (S-mode software interrupt pending)
     // 宣布 S-mode 软件中断处理完成
     // 在 trap.S 里面有对应的两条命令, 去找找

@@ -13,7 +13,8 @@ int main()
         pmem_init();
         kvm_init();
         kvm_inithart();
-
+        trap_kernel_init();
+        trap_kernel_inithart();
         printf("cpu %d is booting!\n", cpuid);
 
         __sync_synchronize();
@@ -25,7 +26,7 @@ int main()
 
         __sync_synchronize();
         kvm_inithart();
-
+        trap_kernel_inithart();
         printf("cpu %d is booting!\n", cpuid);
     }
 

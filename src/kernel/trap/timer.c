@@ -45,17 +45,32 @@ static timer_t sys_timer;
 // 时钟创建
 void timer_create()
 {
-
+    spinlock_init(&sys_timer.lk, "timer");
+    sys_timer.ticks = 0;
 }
 
 // 时钟更新
 void timer_update()
 {
-
+    /*
+    CPU 0 和 CPU 1 都可能收到中断
+    ticks 是共享变量
+    ticks++ 不是原子操作
+    所以要加锁
+    */
+    spinlock_acquire(&sys_timer.lk);
+    sys_timer.ticks++;
+    spinlock_release(&sys_timer.lk);
 }
 
 // 获取滴答数量 (不把sys_timer暴露出去, 只提供安全的访问接口)
 uint64 timer_get_ticks()
 {
+    uint64 ticks;
 
+    spinlock_acquire(&sys_timer.lk);
+    ticks = sys_timer.ticks;
+    spinlock_release(&sys_timer.lk);
+
+    return ticks;
 }

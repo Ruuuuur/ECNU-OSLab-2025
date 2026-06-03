@@ -17,9 +17,10 @@ void start()
     w_tp(id);
 
     // 委托S-mode处理trap，时钟中断仍先由M-mode处理
-
+    w_medeleg(0xffff);
+    w_mideleg(0xffff & ~MIE_MTIE);
     // 时钟中断初始化 (唯一需要在M-mode处理的中断)
-
+    timer_init();
     // 修改mstatus寄存器，假装上一个状态是S-mode
     uint64 status = r_mstatus();
     status &= ~MSTATUS_MPP_MASK;

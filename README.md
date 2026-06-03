@@ -1,260 +1,268 @@
-# LAB-3: 中断异常初步
+# LAB-3: 中断和异常
 
-**前言**
+本次实验在 LAB-1 的启动、UART 输出和自旋锁，以及 LAB-2 的物理内存和内核页表基础上，实现了内核态中断处理框架。完成后，内核可以响应 UART 外设中断和 CLINT 时钟中断，支持串口输入回显、换行、Backspace 删除，以及系统时钟 ticks 的维护。
 
-前两个实验其实留了两个坑没有填:
+## 实现内容
 
-- lab-1中实现了UART的输入输出函数, 但是printf只用到输出函数, 输入函数没有发挥作用
+本次实验主要完成了以下内容：
 
-- lab-2中内核页表映射了CLINT和PLIC这两种设备, 还没有使用过它们的能力
+- `start()`：进入 S-mode 前完成 trap 委托，并初始化 M-mode 时钟中断
+- `timer_create()`：初始化系统时钟锁和 ticks
+- `timer_update()`：在时钟中断中安全递增 ticks
+- `timer_get_ticks()`：加锁读取当前 ticks
+- `trap_kernel_handler()`：根据 `scause` 区分中断和异常，并分发 S-mode software interrupt 与 S-mode external interrupt
+- `external_interrupt_handler()`：通过 PLIC 识别 UART 中断并调用 `uart_intr()`
+- `uart_intr()`：支持普通字符回显、Enter 换行和 Backspace 删除
+- `main()`：在合适位置接入 trap 初始化流程
 
-在本次实验, 我们会填上这两个小坑——为OS内核引入初级的“中断+异常”的识别和处理能力
+## Trap 委托与初始化
 
-## 代码组织结构
+内核主要运行在 S-mode，因此在 `start()` 从 M-mode 切换到 S-mode 之前，需要先配置 trap 委托。
+
+异常通过 `medeleg` 委托给 S-mode：
+
+```c
+w_medeleg(0xffff);
 ```
-ECNU-OSLAB-2025-TASK
-├── LICENSE        开源协议
-├── .vscode        配置了可视化调试环境
-├── registers.xml  配置了可视化调试环境
-├── common.mk      Makefile中一些工具链的定义
-├── Makefile       编译运行整个项目
-├── kernel.ld      定义了内核程序在链接时的布局
-├── pictures       README使用的图片目录 (CHANGE, 日常更新)
-├── README.md      实验指导书 (CHANGE, 日常更新)
-└── src            源码
-    └── kernel     内核源码
-        ├── arch   RISC-V相关
-        │   ├── method.h
-        │   ├── mod.h
-        │   └── type.h (CHANGE, 新增一些RISC-V中断相关宏定义)
-        ├── boot   机器启动
-        │   ├── entry.S
-        │   └── start.c (TODO, 在M-mode多做一些事情再进入S-mode)
-        ├── lock   锁机制
-        │   ├── spinlock.c
-        │   ├── method.h
-        │   ├── mod.h
-        │   └── type.h
-        ├── lib    常用库
-        │   ├── cpu.c
-        │   ├── print.c
-        │   ├── uart.c
-        │   ├── utils.c
-        │   ├── method.h
-        │   ├── mod.h
-        │   └── type.h
-        ├── mem    内存模块
-        │   ├── pmem.c
-        │   ├── kvm.c
-        │   ├── method.h
-        │   ├── mod.h
-        │   └── type.h
-        ├── trap   陷阱模块
-        │   ├── plic.c (NEW, 请阅读和理解这部分)
-        │   ├── timer.c (TODO, 时钟中断和计时器相关操作)
-        │   ├── trap_kernel.c (TODO, 内核态trap处理的核心逻辑)
-        │   ├── trap.S (NEW, 很重要, 请完全理解这部分)
-        │   ├── method.h (CHANGE)
-        │   ├── mod.h
-        │   └── type.h (CHANGE)
-        └── main.c (TODO, 更多的初始化)
+
+大部分中断通过 `mideleg` 委托给 S-mode，但 M-mode timer interrupt 需要保留在 M-mode 处理：
+
+```c
+w_mideleg(0xffff & ~MIE_MTIE);
 ```
-**标记说明**
 
-**NEW**: 新增源文件, 直接拷贝即可, 无需修改
+保留 M-mode timer interrupt 的原因是 CLINT 的 `mtime` 和 `mtimecmp` 相关寄存器只能由 M-mode 访问。时钟中断先进入 M-mode 的 `timer_vector`，更新下一次触发时间后，再设置 S-mode software interrupt pending bit，将处理流程转发给 S-mode。
 
-**CHANGE**: 旧的源文件发生了更新, 直接拷贝即可, 无需修改
+`start()` 中还需要调用：
 
-**TODO**: 你需要实现新功能 / 你需要完善旧功能
+```c
+timer_init();
+```
 
-## 初步认识中断和异常
+该函数负责设置当前 CPU 的 `mtimecmp`、配置 `mscratch`、设置 `mtvec`，并打开 M-mode 时钟中断。
 
-中断、异常、陷入等概念在不同体系结构下(ARM, x86, MIPS...)定义有一些区别, 这里只讨论RISC-V的定义
+## S-mode Trap 入口
 
-RISC-V用陷阱(trap)的概念统筹二者: 陷阱可以分为中断(interrupt)和异常(exception)两种类型
+S-mode trap 入口由 `trap.S` 中的 `kernel_vector` 提供。每个 CPU 在 `trap_kernel_inithart()` 中执行：
 
-**共同点:**
+```c
+w_stvec((uint64)kernel_vector);
+w_sie(r_sie() | SIE_SEIE | SIE_SSIE);
+intr_on();
+```
 
-- 中断和异常都是对正常执行流的一种打断, OS内核临时处理一个紧急的事情, 随后返回原来的执行流
+其中：
 
-- 中断和异常都涉及特权级的陷入和返回, 例如U-mode陷入S-mode再返回U-mode (也可以是同级的)
+```text
+SIE_SEIE: 允许 S-mode external interrupt，用于 UART/PLIC
+SIE_SSIE: 允许 S-mode software interrupt，用于 M-mode timer 转发
+```
 
-**不同点:**
+`kernel_vector` 的主要职责是保存通用寄存器现场，调用 `trap_kernel_handler()`，恢复寄存器现场，最后通过 `sret` 返回原来的执行流。
 
-- 中断是同步过程, 假设发生中断的指令地址为PC, 中断处理完成后, 会继续执行PC+4对应的指令 (下一条指令)
+## Trap 分发
 
-- 异常是异步过程, 假设发生异常的指令地址为PC, 异常处理完成后, 会重新执行PC对应的指令
+`trap_kernel_handler()` 通过 `scause` 判断 trap 类型。
 
-**从程序的角度来看:**
+最高位用于区分中断和异常：
 
-- 遇到**中断**往往是意料之内的事, 甚至是期待发生的事 (需要串口中断读取字符, 需要时钟中断指导调度)
+```c
+if (scause & 0x8000000000000000ul) {
+    // interrupt
+} else {
+    // exception
+}
+```
 
-- 遇到**异常**往往是因为代码本身有问题 (除了ecall和page fault这两种可控的情况)
+低位的 `trap_id` 用于进一步区分具体原因：
 
-**具体来说, RISC-V定义了以下中断和异常类型:**
+```c
+int trap_id = scause & 0xf;
+```
 
-- RISC-V为三个特权级 (U-mode, S-mode, M-mode) 分别定义了三种中断 (时钟中断, 软件中断, 外设中断)
+本实验需要处理两类 S-mode 中断：
 
-- RISC-V定义了十几种异常类型 (包括内存读取带来的越界, 内存写入带来的越界, 非法指令, ecall等)
+```text
+trap_id = 1: S-mode software interrupt，用于时钟中断转发
+trap_id = 9: S-mode external interrupt，用于 UART 外设中断
+```
 
-![pic](./pictures/01.png)
+对应分发逻辑为：
 
-**关于CLINT和PLIC:**
+```c
+case 1:
+    timer_interrupt_handler();
+    break;
 
-- CLINT (core-local interruptor) 是每个CPU都有的机制, 负责接收**时钟中断和软件中断**
+case 9:
+    external_interrupt_handler();
+    break;
+```
 
-- PLIC (platform-level interrupt controller) 是所有CPU共享的机制, 负责接收**外设中断**
+对于当前实验未处理的中断或异常，默认分支会打印 `sepc`、`stval` 和 `trap_id` 等调试信息，然后调用 `panic()` 终止。这符合本实验阶段对异常处理的要求。
 
-本次实验我们主要实现串口中断(一种外设中断)和时钟中断
+## UART 外设中断
 
-## 串口中断
+UART 中断通过 PLIC 转发给 S-mode。处理流程如下：
 
-**任务清单:**
+```text
+UART 输入
+-> PLIC
+-> S-mode external interrupt
+-> kernel_vector
+-> trap_kernel_handler()
+-> external_interrupt_handler()
+-> uart_intr()
+```
 
-1. 由于OS内核主要运行在S-mode, 需要在start函数进入main函数之前, 将trap响应的任务"委托"给S-mode (寄存器操作)
+`external_interrupt_handler()` 中通过 `plic_claim()` 获取当前外设中断号。如果中断号是 `UART_IRQ`，则调用 `uart_intr()` 处理输入；处理完成后调用 `plic_complete(irq)` 告诉 PLIC 该中断已经完成。
 
-2. lab-1给了一个UART输入函数的初步版本, 你需要让它支持换行和Backspace的能力, 思考一下怎么修改
+UART 输入处理支持三种情况：
 
-3. 找到一种方法识别UART输入引发的中断信号
+- 普通字符：原样回显
+- Enter：将 `\r` 转换成 `\n` 输出
+- Backspace / DEL：输出 `\b`、空格、`\b`，实现屏幕上的删除效果
 
-4. 在合适的地方调用完善后的`uart_intr`来处理UART中断 (只用回显字符)
+Backspace 的三个输出含义是：
 
-**1和2比较容易, 下面具体介绍3和4:**
-
-首先关注`trap_kernel_init`和`trap_kernel_inithart`, 你应该在`main`的合适位置调用它们, 完成中断相关初始化
-
-初始化过程包括: 设置各种中断的优先级、使能中断开关、设置响应阈值等, 主要在`plic_init`和`plic_inithart`中
-
-`trap_kernel_inithart`还做了一个重要的工作, 将S-mode的中断入口地址设置为`kernel_vector`(in trap.S)
-
-意味着在S-mode发生中断后, PLIC会立刻让执行流跳转到`kernel_vector`的位置
-
-`kernel_vector`的逻辑分为四个部分 (前置知识:RISC-V规定函数栈在内存里从高地址向低地址生长):
-
-- 上下文保存: 函数栈扩展以空出32*8个字节的空间, 将32个通用寄存器的状态保存到内存空间
-
-- 进入核心的陷阱处理逻辑: `call trap_kernel_handler`
-
-- 上下文恢复: 从内存空间恢复32个通用寄存器的状态, 收缩函数栈以释放这部分内存空间
-
-- 通过`sret`从陷阱处理执行流回到正常执行流
-
-可以看出, 其实`kernel_vector`核心就是为了保证`trap_kernel_handler`能不受干扰地执行
-
-`trap_kernel_handler`的逻辑本质就是一个`switch-case`过程:
-
-- 通过状态寄存器保存的信息判断trap类型 (两个大类 + N个小类)
-
-- 调用合适的处理函数来响应对应类型的trap (`external_interrupt_handler`)
-
-- 如果遇到意料之外/无法处理的中断和异常, 输出报错信息并终止即可
-
-`external_interrupt_handler` 需要利用PLIC提供的能力来判断是哪一种外设中断
-
-如果发现是串口中断, 调用对应的`uart_intr`作处理
-
-**逻辑流程梳理**: 串口中断发生->`kernel_vector`前半部分->`trap_kernel_handler`->
-
-`external_interrupt_handler`->`uart_intr`->`kernel_vector`后半部分
+```text
+\b: 光标左移一格
+空格: 覆盖原字符
+\b: 光标再次左移，停在被删除的位置
+```
 
 ## 时钟中断
 
-时钟是计算机的核心底层机制之一, 是机器指令有序执行的"心跳"或"节拍"
+时钟中断分为 M-mode 和 S-mode 两段处理。
 
-**RISC-V提供的时钟模型是这样的:**
+M-mode 部分由 `timer_init()` 和 `timer_vector` 协作完成：
 
-- **cycle**是最基本的时间单位, 不可拆分
+- 设置当前 CPU 的 `mtimecmp`
+- 设置 `mscratch`，供 `timer_vector` 暂存寄存器和读取 `mtimecmp` 地址
+- 设置 `mtvec` 为 `timer_vector`
+- 打开 M-mode timer interrupt
+- 每次时钟中断时更新下一次 `mtimecmp`
+- 设置 `sip.SSIP`，制造 S-mode software interrupt
 
-- **MTIME**寄存器存储了从内核启动到此刻的cycle数量--`C1`
+S-mode 部分由 `timer_interrupt_handler()` 完成：
 
-- **MTIMECMP**寄存器存储了一个目标的cycle数量--`C2`
+```c
+if(mycpuid() == 0){
+    timer_update();
+}
 
-- 如果某个时刻`C1`和`C2`相等, 则产生一个**时钟中断信号**
+w_sip(r_sip() & ~2);
+```
 
-- 时钟中断处理过程中, **MTIMECMP**寄存器会被更新成一个更大的值, 以确保一段时间后能再次触发时钟中断
+因为多个 CPU 都可能收到时钟中断，而 `ticks` 是共享资源，所以只让 CPU0 更新系统 ticks。`timer_update()` 内部使用自旋锁保护 `ticks++`，保证并发安全。
 
-- 通常来说, **MTIMECMP**寄存器的每次更新都是`C2 = C2 + INTERVAL`, 以保证规律性
+最后通过清除 `sip.SSIP` 宣布 S-mode software interrupt 处理完成。
 
-- 也就是说, 每隔**INTERVAL**个cycle, 产生一个时钟中断, 这个间隔被称为**tick**
+## 初始化顺序
 
-- 在我们的环境下, **INTERVAL**默认设置为1000000, 对应真实世界的大约0.1秒
+CPU0 负责全局初始化：
 
-OS内核维护了一个全局的系统时钟, 它由一个ticks和自选锁组成
+```c
+print_init();
+pmem_init();
+kvm_init();
+kvm_inithart();
+trap_kernel_init();
+trap_kernel_inithart();
+```
 
-你需要完成三个简单的操作函数: 时钟初始化, 时钟写入(ticks++), 时钟读取(返回ticks)
+其他 CPU 等待 CPU0 完成全局初始化后，只需要完成本 CPU 独有的页表和 trap 初始化：
 
-**完成前置步骤后, 我们正式讨论时钟中断的实现:**
+```c
+kvm_inithart();
+trap_kernel_inithart();
+```
 
-相比串口中断, 时钟中断的一个重要区别是: 相关寄存器(**MTIME**、**MTIMECMP**等)只能在M-mode访问
+`trap_kernel_init()` 只由 CPU0 调用一次，因为它初始化的是共享的 PLIC 优先级和系统时钟。`trap_kernel_inithart()` 每个 CPU 都要调用，因为 `stvec`、`sie` 和 PLIC hart 配置都属于每个 CPU 自己的状态。
 
-因此, 时钟中断处理分为M-mode部分逻辑和S-mode部分逻辑
+## 测试结果
 
-**M-mode部分:**
+### 编译测试
 
-- 在`start`进入`main`之前, 需要完成时钟初始化
+测试目标：确认 lab3 实现后可以从干净状态完整构建。
 
-- 时钟初始化函数`timer_init`负责设置**MTIMECMP**寄存器的初始值、设置M-mode的trap处理入口、使能时钟中断等
+测试命令：
 
-- 时钟中断发生后, 执行流自动跳转到**mtvec**寄存器中存放的`timer_vector`(in trap.S)
+```bash
+make clean && make build
+```
 
-- `timer_vector`与`timer_init`通过**cur_mscratch**变量完成精妙配合, 实现**MTIMECMP**寄存器的更新
+测试结果：构建通过，仅出现链接器关于 RWX segment 的 warning，该 warning 在当前实验框架中可以忽略。
 
-- 手动制造一个S-mode的软件中断, 将控制流转移到S-mode的trap处理入口`kernel_vector`
+```text
+riscv64-linux-gnu-ld: warning: target/kernel/kernel-qemu.elf has a LOAD segment with RWX permissions
+```
 
-- 通过`mret`从陷阱处理执行流回到正常执行流
+### 时钟滴答测试
 
-**S-mode部分:**
+测试目标：确认 CLINT timer interrupt 能周期性触发，并最终进入 S-mode 的 `timer_interrupt_handler()` 更新 ticks。
 
-软件中断发生->`kernel_vector`前半部分->`trap_kernel_handler`->`timer_interrupt_handler`
+测试方法：临时在 `timer_interrupt_handler()` 中加入 ticks 输出，只在 CPU0 更新并打印 ticks。
 
-->`timer_update` + 宣布S-mode软件中断处理完成->`kernel_vector`后半部分
+临时代码：
 
-**时钟中断的流程图如下所示:**
+```c
+if(mycpuid() == 0){
+    timer_update();
+    printf("cpu: %d, ticks = %d\n", mycpuid(), (int)timer_get_ticks());
+}
+```
 
-![pic](./pictures/02.png)
+运行后可以观察到 ticks 持续递增，说明下面的链路已经打通：
 
-## 测试用例
+```text
+CLINT timer interrupt
+-> M-mode timer_vector
+-> 设置 sip.SSIP
+-> S-mode software interrupt
+-> kernel_vector
+-> trap_kernel_handler()
+-> timer_interrupt_handler()
+```
 
-**1. 时钟滴答测试, 在合适的地方加一行滴答输出**
+测试完成后删除临时 `printf`，正式代码中只保留 `timer_update()`。
 
-![pic](./pictures/03.png)
+运行结果：
 
-**2. 时钟快慢测试, 在合适的地方加一行ticks输出**
+![时钟滴答测试](pictures/dida%20test.png)
 
-![pic](./pictures/04.png)
+### UART 输入测试
 
-tips: 修改**INTERVAL**, 观察ticks输出速度, 体会时钟滴答的快慢变化
+测试目标：确认 UART 外设中断可以被 PLIC 转发并由内核处理，同时验证普通字符、Enter 和 Backspace 的回显行为。
 
-**3. UART输入测试, 验证是否能输入字符并回显到屏幕上(包括Backspace和换行)**
+测试方式：运行内核后，在 QEMU 终端输入字符并观察输出。
 
-![pic](./pictures/05.png)
+测试要点：
 
-**补充更多测试用例**
+- 输入普通字符，可以正常回显
+- 按 Enter，可以正确换行
+- 按 Backspace，可以删除屏幕上的前一个字符
 
-助教给出的测试用例是远远不够的, 你需要补充更多测试用例以保证新增代码的正确性 
+测试链路：
 
-可以将你新增的测试用例和测试结果放在你的READM里面
+```text
+UART input
+-> PLIC
+-> S-mode external interrupt
+-> kernel_vector
+-> trap_kernel_handler()
+-> external_interrupt_handler()
+-> uart_intr()
+```
 
-另外, 值得强调的一点是：学会使用`panic`和`assert`做必要的检查
+运行结果：
 
-在出问题前输出有价值的错误信息, 比系统直接卡死或进入错误状态, 更容易Debug
+![UART 输入测试](pictures/UART%20input%20test.png)
 
-**尾声**
+## 实验结论
 
-通过前三个实验, 我们搭建了OS内核的基础设施 (第一阶段)
+本次实验完成了内核态中断处理的基础框架。内核能够将大部分 trap 委托给 S-mode，同时保留 M-mode timer interrupt 以访问 CLINT 时钟寄存器。通过 `timer_vector` 将 M-mode timer interrupt 转换为 S-mode software interrupt 后，内核可以在 S-mode 中统一维护系统 ticks。
 
-- lab-1: 机器启动、标准输出、自旋锁
+UART 部分通过 PLIC 接收外设中断，并在 `external_interrupt_handler()` 中识别 `UART_IRQ` 后调用 `uart_intr()`。最终实现了串口输入回显、换行和 Backspace 删除。
 
-- lab-2: 物理内存、内核态虚拟内存
-
-- lab-3: 中断和异常 (串口输入和时钟滴答)
-
-一切的准备都是为了引出OS内核世界中最重要的概念--进程 (第二阶段)
-
-- 进程需要基本的输入输出能力
-
-- 进程需要自己的内存资源和虚拟地址空间
-
-- 进程需要通过系统调用(一种异常)来获取OS内核服务
-
-**新手村任务结束了, 准备接受更大的挑战吧......**
+实验完成后，内核可以正常启动两个 CPU，响应时钟中断和 UART 输入中断，为后续进程、系统调用和调度相关实验提供了基础中断机制。
