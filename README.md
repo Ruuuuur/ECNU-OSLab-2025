@@ -1,209 +1,238 @@
 # LAB-1: 机器启动
 
-## 1. 代码组织结构
-```
-ECNU-OSLAB-2025-TASK  
-├── LICENSE        开源协议  
-├── .vscode        配置了可视化调试环境
-├── registers.xml  配置了可视化调试环境  
-├── Makefile       编译运行整个项目  
-├── common.mk      Makefile中一些工具链的定义  
-├── kernel.ld      定义了内核程序在链接时的布局  
-├── pictures       README使用的图片目录  
-├── README.md      实验指导书  
-└── src            源码
-    └── kernel     内核源码
-        ├── arch   RISC-V相关
-        │   ├── method.h  
-        │   ├── mod.h  
-        │   └── type.h  
-        ├── boot   机器启动
-        │   ├── entry.S  
-        │   └── start.c (TODO)  
-        ├── lock   锁机制
-        │   ├── spinlock.c (TODO)  
-        │   ├── method.h  
-        │   ├── mod.h  
-        │   └── type.h  
-        ├── lib    常用库
-        │   ├── cpu.c  
-        │   ├── print.c (TODO)  
-        │   ├── uart.c  
-        │   ├── method.h  
-        │   ├── mod.h  
-        │   └── type.h  
-        └── main.c (TODO)  
-```
-## 2. 实验核心目标
+本次实验实现了 RISC-V 内核的基本启动流程、UART 标准输出、错误处理机制和自旋锁。完成后，内核可以在 QEMU 中以双核方式启动，从 M-mode 切换到 S-mode，进入 `main()`，并通过 `printf()` 输出启动信息。
 
-完成双核的机器启动, 进入main函数并输出启动信息 (如下图)  
+## 实现内容
 
-![alt text](pictures/01.png)
+本次实验主要完成了以下函数和模块：
 
-## 3. 具体任务
+- `start()`：完成启动早期的 CSR 配置，从 M-mode 切换到 S-mode 并进入 `main()`
+- `spinlock_init()`：初始化自旋锁结构
+- `spinlock_holding()`：判断当前 CPU 是否持有指定自旋锁
+- `spinlock_acquire()`：通过原子操作获取自旋锁，并在持锁期间关闭中断
+- `spinlock_release()`：释放自旋锁，并恢复中断状态
+- `print_init()`：初始化 UART 和 `printf` 使用的自旋锁
+- `printf()`：实现基本格式化输出
+- `panic()`：输出错误信息并停止内核
+- `assert()`：在条件不满足时调用 `panic()`
+- `main()`：协调双核启动并输出启动信息
 
-### 3.1 机器启动本身
+## 启动流程
 
-要想实现上述核心目标，仔细想想只需要完成两件事
+QEMU 启动后会将内核加载到 `0x80000000`，并从 `_entry` 开始执行。`_entry` 位于 `src/kernel/boot/entry.S`，此时 CPU 仍处于 M-mode。
 
-1. 让内核在在QEMU上跑起来（双核启动）：**entry.S** 到 **start.c** 到 **main.c**  
+`entry.S` 的主要工作是为每个 CPU 设置独立的启动栈：
 
-2. 让内核向屏幕输出一些字符串，也就是实现C语言中经常调用的`printf()`
-
-第一件事需要你研究一下xv6的启动流程，只需要看到进入 **main.c** 就够了
-
-第二件事需要你先阅读一下**uart.c**，里面包括串口（最基本的字符输入输出设备）驱动
-
-读完之后你需要利用uart层的函数完成**print.c**中的函数，你可以参考xv6的实现，也可以自己去做
-
-### 3.2 printf面临的资源竞争问题
-
-串口是一种设备资源, `printf()`利用它输出字符本质是在一段时间内持有这种资源
-
-例如, 输出`"hello,world!"`其实是连续占用串口资源12次, 调用12次`uart_putc_sync()`
-
-假设同时存在第二个`printf()`执行流要打印`"hello,os!"`, 它就会与执行流1形成竞争关系
-
-两条执行流交错带来的输出可能包括:
-
-```
-# 混乱的情况
-hellohello,,world!os!
-hheelllloo,,wosrld!!
-hhello,world!ello,os!
-......
-# 有序的情况
-hello,world!hello,os!
-hello,os!hello,world!
+```asm
+la sp, CPU_stack
+li a0, 4096
+csrr a1, mhartid
+addi a1, a1, 1
+mul a0, a0, a1
+add sp, sp, a0
+call start
 ```
 
-我们需要一种手段, 保证`printf()`过程中, UART资源始终只被一个执行流占有同时不可抢占
+`CPU_stack` 是在 `start.c` 中定义的数组：
 
-生活中的例子: 公共卫生间通过"门锁"来保证马桶这一资源在一段时间内只被一人独占
-
-影射到操作系统, 最简单的"资源锁"就是“自旋锁”, 它的实现位于**spinlock.c**
-
-```
-# 在printf中使用自旋锁的方法
-
-spinlock_t lk;
-
-# 锁的初始化
-spinlock_init(&lk, "print_lk");
-
-# 上锁
-spinlock_acquire(&lk);
-
-# 独占资源
-uart_putc_sync();
-uart_putc_sync();
-......
-
-# 解锁
-spinlock_release(&lk);
-
+```c
+__attribute__((aligned(16))) uint8 CPU_stack[4096 * NCPU];
 ```
 
-自旋锁的可靠性依赖**开关中断**和**原子操作**这两个关键概念，你需要完全理解
+不同 CPU 根据自己的 `mhartid` 计算对应栈顶，避免多个 CPU 共用同一段栈空间。
 
-- 开关中断可以保证单CPU情况下进程(执行流)切换的时候不会影响上锁操作的原子性
+## M-mode 到 S-mode
 
-- 原子操作可以保证多CPU的情况下并行执行流不会同时上锁成功
+`start()` 负责完成进入 `main()` 前的关键配置。
 
-完成上述工作后，你应当可以实现图片所示的效果 (在**main.c**的合适位置输出这两句话)  
+首先关闭分页，当前阶段直接使用物理地址：
 
-## 4. 课后实验
-
-这里有两个额外的实验帮助你理解锁的用处 
-
-### 4.1 并行加法
-
-``` 
-    volatile static int started = 0;
-
-    volatile static int sum = 0;
-
-    int main()
-    {
-        int cpuid = r_tp();
-        if(cpuid == 0) {
-            print_init();
-            printf("cpu %d is booting!\n", cpuid);        
-            __sync_synchronize();
-            started = 1;
-            for(int i = 0; i < 1000000; i++)
-                sum++;
-            printf("cpu %d report: sum = %d\n", cpuid, sum);
-        } else {
-            while(started == 0);
-            __sync_synchronize();
-            printf("cpu %d is booting!\n", cpuid);
-            for(int i = 0; i < 1000000; i++)
-                sum++;
-            printf("cpu %d report: sum = %d\n", cpuid, sum);
-        }   
-        while (1);    
-    }  
+```c
+w_satp(0);
 ```
 
-在 **main.c** 中测试上述代码，很明显，我们的预期是后report的cpu应该告诉我们 `sum = 2000000`
+由于切换到 S-mode 后不能再直接访问 M-mode 的 `mhartid`，所以需要提前把当前 CPU 的 hart id 保存到 `tp` 寄存器：
 
-但是实际结果可能是这样的  
-
+```c
+int id = r_mhartid();
+w_tp(id);
 ```
+
+随后修改 `mstatus.MPP`，让 `mret` 返回时进入 S-mode：
+
+```c
+uint64 status = r_mstatus();
+status &= ~MSTATUS_MPP_MASK;
+status |= MSTATUS_MPP_S;
+w_mstatus(status);
+```
+
+再将 M-mode 的返回地址设置为 `main()`：
+
+```c
+w_mepc((uint64)main);
+```
+
+最后执行：
+
+```c
+asm volatile("mret");
+```
+
+CPU 会从 M-mode 切换到 S-mode，并从 `main()` 继续运行。
+
+## 双核启动同步
+
+`main()` 中使用 `started` 变量协调 CPU0 和其他 CPU 的启动顺序。
+
+CPU0 负责初始化输出系统：
+
+```c
+if(cpuid == 0){
+    print_init();
+    printf("cpu %d is booting!\n", cpuid);
+
+    __sync_synchronize();
+    started = 1;
+}
+```
+
+其他 CPU 等待 `started` 被设置后再继续输出：
+
+```c
+while(started == 0)
+    ;
+
+__sync_synchronize();
+printf("cpu %d is booting!\n", cpuid);
+```
+
+这样可以保证 `print_init()` 已经完成，避免其他 CPU 在 UART 和 `printf` 锁初始化之前调用 `printf()`。
+
+## 自旋锁
+
+自旋锁用于保护多 CPU 共享资源。本实验中最重要的共享资源是 UART 输出设备。`printf()` 会连续调用 `uart_putc_sync()` 输出多个字符，如果多个 CPU 同时执行 `printf()`，输出可能交错。
+
+自旋锁结构中保存了锁状态、锁名和持锁 CPU：
+
+```c
+typedef struct spinlock {
+    uint locked;
+    char *name;
+    int cpuid;
+} spinlock_t;
+```
+
+获取锁时使用原子指令：
+
+```c
+while (__sync_lock_test_and_set(&lk->locked, 1) != 0)
+    ;
+```
+
+释放锁时使用：
+
+```c
+__sync_lock_release(&lk->locked);
+```
+
+为了避免持锁期间被中断打断而造成死锁风险，`spinlock_acquire()` 会先调用 `push_off()` 关闭中断，`spinlock_release()` 在释放锁后调用 `pop_off()` 恢复中断状态。
+
+`push_off()` 和 `pop_off()` 维护了一个嵌套计数 `noff`，使得多层关中断可以正确配对恢复，而不是简单地每次 `pop_off()` 都直接打开中断。
+
+## printf 实现
+
+`print_init()` 完成两件事：
+
+```c
+uart_init();
+spinlock_init(&print_lk, "printf");
+```
+
+`printf()` 使用 `stdarg.h` 中的 `va_list` 读取可变参数，并根据格式字符输出不同类型的数据。
+
+本次实验实现的格式包括：
+
+- `%d`：十进制有符号整数
+- `%x`：十六进制整数
+- `%p`：指针地址
+- `%c`：字符
+- `%s`：字符串
+- `%%`：百分号本身
+
+为了防止多 CPU 输出交错，`printf()` 在输出前获取 `print_lk`，输出结束后释放锁：
+
+```c
+spinlock_acquire(&print_lk);
+...
+spinlock_release(&print_lk);
+```
+
+## 错误处理
+
+`panic()` 用于在内核出现严重错误时输出错误信息并停止执行：
+
+```c
+printf("panic! %s\n", s);
+panicked = 1;
+while (1)
+    ;
+```
+
+`assert()` 用于检查条件是否成立。如果条件不满足，则调用 `panic()`：
+
+```c
+if(!condition){
+    panic(warning);
+}
+```
+
+这为后续实验中的内存管理、页表管理和 trap 处理提供了基础调试机制。
+
+## 测试结果
+
+### 编译测试
+
+测试目标：确认 lab1 实现后可以从干净状态完整构建。
+
+测试命令：
+
+```bash
+make clean && make build
+```
+
+测试结果：构建通过，仅出现链接器关于 RWX segment 的 warning，该 warning 在当前实验框架中可以忽略。
+
+```text
+riscv64-linux-gnu-ld: warning: target/kernel/kernel-qemu.elf has a LOAD segment with RWX permissions
+```
+
+### 双核启动测试
+
+测试目标：确认两个 CPU 都能完成启动流程，进入 `main()`，并通过 UART 输出启动信息。
+
+测试命令：
+
+```bash
+make run
+```
+
+运行结果中可以看到：
+
+```text
 cpu 0 is booting!
 cpu 1 is booting!
-cpu 0 report: sum = 1128497
-cpu 1 report: sum = 1143332
 ```
 
-考虑如何使用锁进行修正，修正后的输出可能是这样的  
+这说明 `_entry -> start() -> main()` 的启动链路已经打通，CPU0 完成输出初始化后，CPU1 也能继续运行并输出信息。
 
-```
-cpu 0 is booting!
-cpu 1 is booting!
-cpu 0 report: sum = 1996573
-cpu 1 report: sum = 2000000
-```
+运行结果：
 
-简单说明上锁和解锁的位置不同会有什么影响（tips: 锁的粒度粗细）
+![双核启动测试](pictures/test.png)
 
-### 4.2 并行输出  
+## 实验结论
 
-尝试去掉`printf`里的锁，参考4.1的实验思路，设计测试方法使得`printf`的输出出现交错的情况  
+本次实验完成了操作系统内核最基础的启动和输出能力。内核可以在 QEMU 中从 M-mode 启动，完成每个 CPU 的栈设置，将 hart id 保存到 `tp`，通过 `mret` 进入 S-mode 并执行 `main()`。
 
-4.1和4.2的测试代码和实验结果可以附在你的README中, 但是不要体现在你的代码里
+同时，本实验实现了 UART 标准输出、`printf()`、`panic()`、`assert()` 和自旋锁机制。`printf()` 通过自旋锁保护 UART 设备，避免多 CPU 并发输出时发生字符交错。
 
-## 5. 关于代码仓库的维护
-
-1. 每次实验需要在上次实验的基础上继续往下做，假设你已经完成lab-0(master)
-
-    那么你此时应该在lab-0(master)分支下使用`git checkout -b lab-1`命令创建并切换到新的分支lab-1  
-
-    此时新建的lab-1会继承lab-0(master)的内容，但你对lab-1的修改不会影响到lab-0  
-
-    以此类推，当你从lab-1开始走到lab-9时，你会获得越来越完整和强大的内核  
-
-2. 你的代码仓库应该由 **代码 + Markdown文档** 两部分构成  
-
-    文档内容不做明确要求，你有很高的自由度决定写什么和写多少
-
-    提供一些建议: 
-    
-    - 本次实验新增了哪些功能，实现了什么效果
-
-    - 对本次实验中某个过程的理解和思考
-
-    - 本次实验和之前的实验构成什么样的逻辑联系
-
-    - 本次实验花费的时间, 你和队友的贡献分别是什么
-
-    - 可以使用markdown的分层分点来增加条理性，便于别人阅读和抓住重点
-
-    **总之，这是你的代码仓库，请对你自己的代码和文档负责**  
-    
-    **注意，代码是继承和连续发展的, 但文档不是，每次的文档都是全新一页**  
-
-3. 提醒: 之所以要求大家维护代码仓库，是为了查看大家的提交记录
-
-    所以请及时同步当天写的代码到线上仓库，不要攒到最后一口气提交，否则可能被误判为不当行为
