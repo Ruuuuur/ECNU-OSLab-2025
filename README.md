@@ -182,21 +182,6 @@ trap_kernel_inithart();
 
 ## 测试结果
 
-### 编译测试
-
-测试目标：确认 lab3 实现后可以从干净状态完整构建。
-
-测试命令：
-
-```bash
-make clean && make build
-```
-
-测试结果：构建通过，仅出现链接器关于 RWX segment 的 warning，该 warning 在当前实验框架中可以忽略。
-
-```text
-riscv64-linux-gnu-ld: warning: target/kernel/kernel-qemu.elf has a LOAD segment with RWX permissions
-```
 
 ### 时钟滴答测试
 
