@@ -1,93 +1,235 @@
-# LAB-3: 中断和异常
+# LAB-4: 第一个用户进程的诞生
 
-本次实验在 LAB-1 的启动、UART 输出和自旋锁，以及 LAB-2 的物理内存和内核页表基础上，实现了内核态中断处理框架。完成后，内核可以响应 UART 外设中断和 CLINT 时钟中断，支持串口输入回显、换行、Backspace 删除，以及系统时钟 ticks 的维护。
+## 实验目标
 
-## 实现内容
+本次实验的目标是在已有前三个Lab完成的基础上，引入第一个用户进程 `proczero`，并打通用户态与内核态之间的系统调用流程。
 
-本次实验主要完成了以下内容：
-
-- `start()`：进入 S-mode 前完成 trap 委托，并初始化 M-mode 时钟中断
-- `timer_create()`：初始化系统时钟锁和 ticks
-- `timer_update()`：在时钟中断中安全递增 ticks
-- `timer_get_ticks()`：加锁读取当前 ticks
-- `trap_kernel_handler()`：根据 `scause` 区分中断和异常，并分发 S-mode software interrupt 与 S-mode external interrupt
-- `external_interrupt_handler()`：通过 PLIC 识别 UART 中断并调用 `uart_intr()`
-- `uart_intr()`：支持普通字符回显、Enter 换行和 Backspace 删除
-- `main()`：在合适位置接入 trap 初始化流程
-
-## Trap 委托与初始化
-
-内核主要运行在 S-mode，因此在 `start()` 从 M-mode 切换到 S-mode 之前，需要先配置 trap 委托。
-
-异常通过 `medeleg` 委托给 S-mode：
-
-```c
-w_medeleg(0xffff);
-```
-
-大部分中断通过 `mideleg` 委托给 S-mode，但 M-mode timer interrupt 需要保留在 M-mode 处理：
-
-```c
-w_mideleg(0xffff & ~MIE_MTIE);
-```
-
-保留 M-mode timer interrupt 的原因是 CLINT 的 `mtime` 和 `mtimecmp` 相关寄存器只能由 M-mode 访问。时钟中断先进入 M-mode 的 `timer_vector`，更新下一次触发时间后，再设置 S-mode software interrupt pending bit，将处理流程转发给 S-mode。
-
-`start()` 中还需要调用：
-
-```c
-timer_init();
-```
-
-该函数负责设置当前 CPU 的 `mtimecmp`、配置 `mscratch`、设置 `mtvec`，并打开 M-mode 时钟中断。
-
-## S-mode Trap 入口
-
-S-mode trap 入口由 `trap.S` 中的 `kernel_vector` 提供。每个 CPU 在 `trap_kernel_inithart()` 中执行：
-
-```c
-w_stvec((uint64)kernel_vector);
-w_sie(r_sie() | SIE_SEIE | SIE_SSIE);
-intr_on();
-```
-
-其中：
+最终效果：用户程序在 U-mode 中执行 `syscall(SYS_helloworld)`，通过 `ecall` 陷入内核，内核识别系统调用号后输出：
 
 ```text
-SIE_SEIE: 允许 S-mode external interrupt，用于 UART/PLIC
-SIE_SSIE: 允许 S-mode software interrupt，用于 M-mode timer 转发
+proczero: hello world!
 ```
 
-`kernel_vector` 的主要职责是保存通用寄存器现场，调用 `trap_kernel_handler()`，恢复寄存器现场，最后通过 `sret` 返回原来的执行流。
+同时，本实验还验证了用户态运行期间的时钟中断能够正常进入内核处理。
 
-## Trap 分发
+## 地址空间设计
 
-`trap_kernel_handler()` 通过 `scause` 判断 trap 类型。
+用户进程运行时涉及两套页表：
 
-最高位用于区分中断和异常：
+- 用户页表：用于 U-mode 执行用户程序，包含用户代码、用户栈、`trapframe` 和 `trampoline`。
+- 内核页表：用于 S-mode 执行内核代码，包含内核代码数据、设备 MMIO、可分配物理内存、`trampoline` 和进程内核栈。
+
+地址空间布局如下：
+
+![地址空间布局](picture/01.png)
+
+其中比较关键的是 `TRAMPOLINE` 和 `TRAPFRAME`：
+
+- `TRAMPOLINE` 映射到 `trampoline.S` 中的切换代码，并且需要同时出现在用户页表和内核页表的相同虚拟地址处。
+- `TRAPFRAME` 保存用户态寄存器现场，以及返回内核时需要恢复的内核页表、内核栈、hartid 和 trap 处理入口。
+
+## 内核页表扩展
+
+在 `kvm_init()` 中，除了原有的 UART、CLINT、PLIC、内核代码段、内核数据段和可分配内存映射外，本实验新增了两类映射：
 
 ```c
-if (scause & 0x8000000000000000ul) {
-    // interrupt
-} else {
-    // exception
+vm_mappages(kernel_pgtbl, TRAMPOLINE, (uint64)trampoline,
+            PGSIZE, PTE_R | PTE_X);
+
+void *kstack = pmem_alloc(true);
+vm_mappages(kernel_pgtbl, KSTACK(0), (uint64)kstack,
+            PGSIZE, PTE_R | PTE_W);
+```
+
+`TRAMPOLINE` 映射保证从用户态陷入内核后，CPU 可以继续执行同一段切换代码。`KSTACK(0)` 是 `proczero` 的内核栈，用户进程进入内核处理系统调用或中断时，内核函数调用栈就使用这页空间。
+
+`KSTACK(procid)` 每隔两个页面安排一个内核栈，其中未映射的一页作为保护页，用于发现内核栈溢出。
+
+## 第一个用户进程
+
+`proc_make_first()` 负责创建第一个用户进程 `proczero`。初始化流程如下：
+
+1. 设置 `pid = 0`。
+2. 为 `trapframe` 申请物理页。
+3. 创建用户页表，并映射 `TRAMPOLINE` 和 `TRAPFRAME`。
+4. 为用户代码申请物理页，将 `initcode` 拷贝进去，并映射到 `USER_BASE`。
+5. 为用户栈申请物理页，并映射到 `TRAPFRAME - PGSIZE`。
+6. 设置用户态初始 PC 和 SP。
+7. 设置进程内核栈和内核态上下文。
+8. 将当前 CPU 绑定到 `proczero`。
+9. 通过 `swtch()` 切换到 `proczero` 的内核态上下文。
+
+关键字段如下：
+
+```c
+p->tf->user_to_kern_epc = USER_BASE;
+p->tf->sp = TRAPFRAME;
+
+p->kstack = KSTACK(p->pid);
+p->ctx.ra = (uint64)trap_user_return;
+p->ctx.sp = p->kstack + PGSIZE;
+```
+
+`ctx.ra` 设置为 `trap_user_return` 是本实验中一个重要细节。`swtch.S` 在恢复新上下文后执行 `ret`，此时 `ra` 已经是 `proczero.ctx.ra`，因此控制流会跳转到 `trap_user_return()`，再通过 `trampoline.S` 中的 `user_return` 进入 U-mode。
+
+## 用户态返回与陷入
+
+本实验中的用户态切换由 `trap_user_return()`、`user_return`、`user_vector` 和 `trap_user_handler()` 共同完成。
+
+第一次进入用户态的流程为：
+
+```text
+main()
+  -> proc_make_first()
+  -> swtch(&mycpu()->ctx, &p->ctx)
+  -> trap_user_return()
+  -> trampoline.S:user_return
+  -> sret
+  -> U-mode initcode main()
+```
+
+用户程序执行系统调用后的流程为：
+
+```text
+U-mode syscall(SYS_helloworld)
+  -> ecall
+  -> trampoline.S:user_vector
+  -> 保存用户寄存器到 trapframe
+  -> 切换到内核栈和内核页表
+  -> trap_user_handler()
+  -> trap_user_return()
+  -> trampoline.S:user_return
+  -> sret 回到 U-mode
+```
+
+`trap_user_return()` 的主要工作总体来说包括两个方面：一方面是为下一次从用户态陷入内核做准备，另一方面是为本次返回用户态做准备。
+
+对应代码如下：
+
+```c
+void trap_user_return()
+{
+    proc_t *p = myproc();
+
+    /*
+     * 返回用户态的过程会修改 stvec、sepc、sstatus 和页表相关状态，
+     * 中途不应该再被中断打断，所以先关闭中断。
+     */
+    intr_off();
+    //下次进入的准备
+
+    /*
+     * CPU 之后会回到 U-mode。如果用户态再次发生 syscall、中断或异常，
+     * trap 入口应该是 trampoline.S 中的 user_vector。
+     *
+     * user_vector 在内核链接地址中有一个地址，在 TRAMPOLINE 映射区中
+     * 也有一个对应地址。这里计算的是它在 TRAMPOLINE 区域里的虚拟地址。
+     */
+    uint64 user_vector_addr = TRAMPOLINE + ((uint64)user_vector - (uint64)trampoline);
+    w_stvec(user_vector_addr);
+
+    /*
+     * user_vector 刚开始运行时还处在用户页表下，所以需要从 trapframe
+     * 里取出这些内核信息，然后切回内核页表、内核栈，并跳到
+     * trap_user_handler() 继续处理。
+     */
+    p->tf->user_to_kern_satp = r_satp();                   // 当前内核页表
+    p->tf->user_to_kern_sp = p->kstack + PGSIZE;           // 当前进程的内核栈顶
+    p->tf->user_to_kern_trapvector = (uint64)trap_user_handler; // 用户态 trap 的内核处理函数
+    p->tf->user_to_kern_hartid = r_tp();                   // 当前 CPU 的 hartid
+
+    //回去的准备
+    /*
+     * sepc 决定 sret 之后用户程序从哪里继续执行。
+     * 对第一次进入用户态来说，它是 USER_BASE；
+     * 对 syscall 返回来说，它通常已经在 trap_user_handler() 中加过 4。
+     */
+    w_sepc(p->tf->user_to_kern_epc);
+
+    /*
+     * 清除 SPP，表示 sret 的目标特权级是 U-mode；
+     * 设置 SPIE，表示回到用户态后允许响应中断。
+     */
+    uint64 sstatus = r_sstatus();
+    sstatus &= ~SSTATUS_SPP;
+    sstatus |= SSTATUS_SPIE;
+    w_sstatus(sstatus);
+
+    /*
+     * 调用 trampoline.S 中映射到 TRAMPOLINE 区域的 user_return。
+     * user_return 会切换到用户页表，恢复 trapframe 中保存的用户寄存器，
+     * 最后执行 sret 回到 U-mode。
+     */
+    uint64 user_return_addr = TRAMPOLINE + ((uint64)user_return - (uint64)trampoline);
+    void (*fn)(uint64, uint64) = (void (*)(uint64, uint64))user_return_addr;
+
+    /*
+     * 参数一必须传 TRAPFRAME 这个虚拟地址，而不是 p->tf。
+     * 因为 user_return 切换到用户页表后，只有 TRAPFRAME 这个映射仍然有效。
+     *
+     * 参数二是用户页表写入 satp 时需要的值。
+     */
+    fn(TRAPFRAME, MAKE_SATP(p->pgtbl));
 }
 ```
 
-低位的 `trap_id` 用于进一步区分具体原因：
+## 系统调用处理
+
+用户程序位于 `src/user/initcode.c`：
 
 ```c
-int trap_id = scause & 0xf;
+int main()
+{
+    syscall(SYS_helloworld);
+    syscall(SYS_helloworld);
+    while (1)
+        ;
+    return 0;
+}
 ```
 
-本实验需要处理两类 S-mode 中断：
+`syscall()` 最终会执行 RISC-V 的 `ecall` 指令，并将系统调用号放入 `a7` 寄存器。`trampoline.S` 会把用户寄存器保存到 `trapframe`，因此内核可以通过：
 
-```text
-trap_id = 1: S-mode software interrupt，用于时钟中断转发
-trap_id = 9: S-mode external interrupt，用于 UART 外设中断
+```c
+p->tf->a7
 ```
 
-对应分发逻辑为：
+读取系统调用号。
+
+在 `trap_user_handler()` 中，对 U-mode `ecall` 的处理如下：
+
+```c
+case 8:
+    p->tf->user_to_kern_epc += 4;
+
+    if(p->tf->a7 == SYS_helloworld){
+        printf("proczero: hello world!\n");
+        p->tf->a0 = 0;
+    }else{
+        printf("unknown syscall: %d\n", p->tf->a7);
+        p->tf->a0 = -1;
+    }
+    break;
+```
+
+这里必须执行：
+
+```c
+p->tf->user_to_kern_epc += 4;
+```
+
+因为 `sepc` 保存的是 `ecall` 指令本身的地址。如果不加 4，返回用户态后会再次执行同一条 `ecall`，导致系统调用无限重复。
+
+## 用户态中断处理
+
+在用户态运行期间，中断也会先进入 `user_vector`，保存用户寄存器后跳转到 `trap_user_handler()`。
+
+本实验继续复用 LAB-3 中的中断处理逻辑：
+
+- `trap_id = 1`：S-mode software interrupt，用于处理由 M-mode timer interrupt 转发来的时钟中断。
+- `trap_id = 9`：S-mode external interrupt，用于处理 UART 外设中断。
+
+对应分支为：
 
 ```c
 case 1:
@@ -99,155 +241,66 @@ case 9:
     break;
 ```
 
-对于当前实验未处理的中断或异常，默认分支会打印 `sepc`、`stval` 和 `trap_id` 等调试信息，然后调用 `panic()` 终止。这符合本实验阶段对异常处理的要求。
+这说明即使 CPU 正在 U-mode 中执行用户程序，时钟中断和串口中断仍然能够进入内核，由内核统一处理，然后再返回用户态继续执行。
 
-## UART 外设中断
+## 测试方法
 
-UART 中断通过 PLIC 转发给 S-mode。处理流程如下：
+### 系统调用测试
+
+运行：
+
+```bash
+make run
+```
+
+用户程序执行两次：
+
+```c
+syscall(SYS_helloworld);
+syscall(SYS_helloworld);
+```
+
+预期输出两次：
 
 ```text
-UART 输入
--> PLIC
--> S-mode external interrupt
--> kernel_vector
--> trap_kernel_handler()
--> external_interrupt_handler()
--> uart_intr()
+proczero: hello world!
+proczero: hello world!
 ```
 
-`external_interrupt_handler()` 中通过 `plic_claim()` 获取当前外设中断号。如果中断号是 `UART_IRQ`，则调用 `uart_intr()` 处理输入；处理完成后调用 `plic_complete(irq)` 告诉 PLIC 该中断已经完成。
+### 用户态时钟中断测试
 
-UART 输入处理支持三种情况：
-
-- 普通字符：原样回显
-- Enter：将 `\r` 转换成 `\n` 输出
-- Backspace / DEL：输出 `\b`、空格、`\b`，实现屏幕上的删除效果
-
-Backspace 的三个输出含义是：
+为了观察用户态时钟中断是否正常触发，测试时临时加入低频输出，例如每 100 个 tick 打印一次：
 
 ```text
-\b: 光标左移一格
-空格: 覆盖原字符
-\b: 光标再次左移，停在被删除的位置
+user timer interrupt: 100
+user timer interrupt: 200
 ```
 
-## 时钟中断
-
-时钟中断分为 M-mode 和 S-mode 两段处理。
-
-M-mode 部分由 `timer_init()` 和 `timer_vector` 协作完成：
-
-- 设置当前 CPU 的 `mtimecmp`
-- 设置 `mscratch`，供 `timer_vector` 暂存寄存器和读取 `mtimecmp` 地址
-- 设置 `mtvec` 为 `timer_vector`
-- 打开 M-mode timer interrupt
-- 每次时钟中断时更新下一次 `mtimecmp`
-- 设置 `sip.SSIP`，制造 S-mode software interrupt
-
-S-mode 部分由 `timer_interrupt_handler()` 完成：
-
-```c
-if(mycpuid() == 0){
-    timer_update();
-}
-
-w_sip(r_sip() & ~2);
-```
-
-因为多个 CPU 都可能收到时钟中断，而 `ticks` 是共享资源，所以只让 CPU0 更新系统 ticks。`timer_update()` 内部使用自旋锁保护 `ticks++`，保证并发安全。
-
-最后通过清除 `sip.SSIP` 宣布 S-mode software interrupt 处理完成。
-
-## 初始化顺序
-
-CPU0 负责全局初始化：
-
-```c
-print_init();
-pmem_init();
-kvm_init();
-kvm_inithart();
-trap_kernel_init();
-trap_kernel_inithart();
-```
-
-其他 CPU 等待 CPU0 完成全局初始化后，只需要完成本 CPU 独有的页表和 trap 初始化：
-
-```c
-kvm_inithart();
-trap_kernel_inithart();
-```
-
-`trap_kernel_init()` 只由 CPU0 调用一次，因为它初始化的是共享的 PLIC 优先级和系统时钟。`trap_kernel_inithart()` 每个 CPU 都要调用，因为 `stvec`、`sie` 和 PLIC hart 配置都属于每个 CPU 自己的状态。
+如果用户程序进入 `while (1)` 后仍能持续输出 tick 信息，说明 CPU 在 U-mode 空转时，时钟中断仍能通过 `user_vector -> trap_user_handler -> timer_interrupt_handler` 正常处理。
 
 ## 测试结果
 
+测试截图如下：
 
-### 时钟滴答测试
+![测试结果](picture/test.png)
 
-测试目标：确认 CLINT timer interrupt 能周期性触发，并最终进入 S-mode 的 `timer_interrupt_handler()` 更新 ticks。
+从截图中可以看到：
 
-测试方法：临时在 `timer_interrupt_handler()` 中加入 ticks 输出，只在 CPU0 更新并打印 ticks。
+- `make run` 构建并启动 QEMU 成功。
+- 用户程序发出的两次 `SYS_helloworld` 系统调用均被内核正确响应。
+- 用户态运行期间仍能收到时钟中断，并打印 `user timer interrupt: 100` 和 `user timer interrupt: 200`。
 
-临时代码：
+因此，Lab4 的核心功能已经完成：第一个用户进程能够进入 U-mode 执行，能够通过系统调用请求内核服务，并且用户态中断处理链路可以正常工作。
 
-```c
-if(mycpuid() == 0){
-    timer_update();
-    printf("cpu: %d, ticks = %d\n", mycpuid(), (int)timer_get_ticks());
-}
-```
+## 总结
 
-运行后可以观察到 ticks 持续递增，说明下面的链路已经打通：
+本次实验打通了从内核创建用户进程，到用户进程进入 U-mode，再到通过系统调用陷入内核并返回用户态的完整流程。
 
-```text
-CLINT timer interrupt
--> M-mode timer_vector
--> 设置 sip.SSIP
--> S-mode software interrupt
--> kernel_vector
--> trap_kernel_handler()
--> timer_interrupt_handler()
-```
+通过本实验可以更清楚地区分：
 
-测试完成后删除临时 `printf`，正式代码中只保留 `timer_update()`。
+- `context`：用于 S-mode 内部的执行流切换，例如 `swtch()` 从内核主流程切到 `proczero` 的内核态执行流。
+- `trapframe`：用于 U-mode 与 S-mode 之间保存和恢复完整寄存器现场。
+- `trampoline`：用户页表和内核页表共同映射的切换代码，是跨页表、跨特权级切换的桥梁。
+- `kstack`：用户进程陷入内核后使用的内核栈，每个进程拥有自己的内核栈。
 
-运行结果：
-
-![时钟滴答测试](pictures/dida%20test.png)
-
-### UART 输入测试
-
-测试目标：确认 UART 外设中断可以被 PLIC 转发并由内核处理，同时验证普通字符、Enter 和 Backspace 的回显行为。
-
-测试方式：运行内核后，在 QEMU 终端输入字符并观察输出。
-
-测试要点：
-
-- 输入普通字符，可以正常回显
-- 按 Enter，可以正确换行
-- 按 Backspace，可以删除屏幕上的前一个字符
-
-测试链路：
-
-```text
-UART input
--> PLIC
--> S-mode external interrupt
--> kernel_vector
--> trap_kernel_handler()
--> external_interrupt_handler()
--> uart_intr()
-```
-
-运行结果：
-
-![UART 输入测试](pictures/UART%20input%20test.png)
-
-## 实验结论
-
-本次实验完成了内核态中断处理的基础框架。内核能够将大部分 trap 委托给 S-mode，同时保留 M-mode timer interrupt 以访问 CLINT 时钟寄存器。通过 `timer_vector` 将 M-mode timer interrupt 转换为 S-mode software interrupt 后，内核可以在 S-mode 中统一维护系统 ticks。
-
-UART 部分通过 PLIC 接收外设中断，并在 `external_interrupt_handler()` 中识别 `UART_IRQ` 后调用 `uart_intr()`。最终实现了串口输入回显、换行和 Backspace 删除。
-
-实验完成后，内核可以正常启动两个 CPU，响应时钟中断和 UART 输入中断，为后续进程、系统调用和调度相关实验提供了基础中断机制。
+至此，内核已经具备了最小用户进程能力。

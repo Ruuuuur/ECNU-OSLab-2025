@@ -1,5 +1,6 @@
 #include "mod.h"
 
+extern char trampoline[];
 // 内核页表
 static pgtbl_t kernel_pgtbl;
 
@@ -85,7 +86,7 @@ void vm_unmappages(pgtbl_t pgtbl, uint64 va, uint64 len, bool freeit)
     }
 }   
 
-// 完成UART、CLINT、PLIC、内核代码区、内核数据区、可分配区域的页表映射
+// 完成UART、CLINT、PLIC、内核代码区、内核数据区、可分配区域、trampoline、内核栈的页表映射
 // 相当于部分填充kernel_pgtbl
 void kvm_init()
 {
@@ -103,6 +104,11 @@ void kvm_init()
 
     vm_mappages(kernel_pgtbl, (uint64)KERNEL_DATA, (uint64)KERNEL_DATA,
         (uint64)ALLOC_END - (uint64)KERNEL_DATA, PTE_R | PTE_W);
+
+    vm_mappages(kernel_pgtbl, TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
+
+    void *kstack = pmem_alloc(true);
+    vm_mappages(kernel_pgtbl, KSTACK(0), (uint64)kstack, PGSIZE, PTE_R | PTE_W);
 }
 
 // 每个CPU都需要调用, 从不使用页表切换到使用内核页表

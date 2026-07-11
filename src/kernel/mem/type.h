@@ -122,3 +122,15 @@ typedef pte_t* pgtbl_t;
 
 // 定义一个非常大的VA, 正常来说所有VA不得大于它
 #define VA_MAX (1ul << 38)
+
+// S-mode <-> U-mode 切换过程用到的公共代码区域 (内核页表 + 用户页表)
+#define TRAMPOLINE     (VA_MAX - PGSIZE)
+
+// S-mode <-> U-mode 切换过程用到的临时数据区域 (用户页表)
+#define TRAPFRAME      (TRAMPOLINE - PGSIZE)
+
+// 各个进程的内核空间函数栈 (内核页表)
+#define KSTACK(procid) (TRAPFRAME - ((procid) + 1) * 2 * PGSIZE)
+
+// 用户空间基地址 (用户页表)
+#define USER_BASE      (PGSIZE)

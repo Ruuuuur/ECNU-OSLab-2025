@@ -1,6 +1,7 @@
 #include "arch/mod.h"
 #include "lib/mod.h"
 #include "mem/mod.h"
+#include "proc/mod.h"
 #include "trap/mod.h"
 
 volatile static int started = 0;
@@ -15,6 +16,7 @@ int main()
         kvm_inithart();
         trap_kernel_init();
         trap_kernel_inithart();
+        proc_make_first();
         printf("cpu %d is booting!\n", cpuid);
 
         __sync_synchronize();
