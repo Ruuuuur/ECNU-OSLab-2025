@@ -1,7 +1,6 @@
 #pragma once
 #include "../lock/type.h"
 
-
 /*---------------------------------- 关于物理内存 ---------------------------------------*/
 
 /*
@@ -134,3 +133,27 @@ typedef pte_t* pgtbl_t;
 
 // 用户空间基地址 (用户页表)
 #define USER_BASE      (PGSIZE)
+
+/* mmap_region 描述了一个 mmap区域 */
+typedef struct mmap_region
+{
+    uint64 begin;             // 起始地址
+    uint32 npages;            // 管理的页面数量
+    struct mmap_region *next; // 链表指针
+} mmap_region_t;
+
+/* mmap_region_node 是 mmap_region 在仓库里的包装 */
+typedef struct mmap_region_node
+{
+    mmap_region_t mmap;
+    struct mmap_region_node *next;
+} mmap_region_node_t;
+
+/* 最大支持256个mmap_region_node */
+#define N_MMAP 256
+
+// 映射区域的终点 (给ustack留16MB内存空间)
+#define MMAP_END (TRAPFRAME - 16 * 256 * PGSIZE)
+
+// 映射区域的起点 (单个进程的mmap_reagion最大占据64MB内存空间)
+#define MMAP_BEGIN (MMAP_END - 64 * 256 * PGSIZE)
