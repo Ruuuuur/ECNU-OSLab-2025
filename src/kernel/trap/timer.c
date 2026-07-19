@@ -52,12 +52,6 @@ void timer_create()
 // 时钟更新
 void timer_update()
 {
-    /*
-    CPU 0 和 CPU 1 都可能收到中断
-    ticks 是共享变量
-    ticks++ 不是原子操作
-    所以要加锁
-    */
     spinlock_acquire(&sys_timer.lk);
     sys_timer.ticks++;
     spinlock_release(&sys_timer.lk);
@@ -73,4 +67,10 @@ uint64 timer_get_ticks()
     spinlock_release(&sys_timer.lk);
 
     return ticks;
+}
+
+// 让进程睡眠ntick个时钟周期
+void timer_wait(uint64 ntick)
+{
+
 }

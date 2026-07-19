@@ -1,397 +1,499 @@
-# LAB-5：系统调用流程与用户态虚拟内存管理
+# LAB-6: 单进程走向多进程——进程调度与生命周期
 
-## 实验目标
+**前言**
 
-Lab 4 已经完成了第一个用户进程 `proczero`、用户态陷入与返回流程，以及最简单的 `SYS_helloworld` 系统调用。本次实验在此基础上完善系统调用框架和用户地址空间管理，主要目标如下：
+经过lab-4的初创和lab-5的完善, proczero已经比较成熟了
 
-- 建立基于系统调用号和跳转表的通用分发流程。
-- 实现用户地址空间与内核地址空间之间的数据复制。
-- 通过 `brk` 系统调用支持用户堆的扩展与收缩。
-- 通过 Load/Store Page Fault 支持用户栈按需向低地址增长。
-- 使用带锁的静态节点仓库管理 `mmap_region_t`。
-- 实现 mmap 区域的查找、插入、合并、拆分和释放。
-- 实现用户页表的深复制与递归销毁，为后续多进程实验做准备。
+从零到一很缓慢, 但是从一到多很快：可以"复制proczero"来产生更多进程
 
-## 用户地址空间布局
+产生更多进程后, 需要解决新产生的两个问题
 
-本实验将用户虚拟地址空间划分为代码、堆、mmap、栈以及陷阱切换区域：
+- 多个进程会竞争CPU资源 (之前几乎由proczero独占)
 
-```text
-高地址
-VA_MAX
-├── TRAMPOLINE                  共享的用户态/内核态切换代码
-├── TRAPFRAME                   每个进程独有的寄存器现场
-├── 用户栈                      从高地址向低地址增长
-├── MMAP_END
-├── mmap 区域                   [MMAP_BEGIN, MMAP_END)
-├── MMAP_BEGIN
-├── 用户堆                      从低地址向高地址增长
-├── USER_BASE + PGSIZE          初始 heap_top
-├── 用户代码和数据              USER_BASE 开始的一页
-└── 未映射保护页                [0, USER_BASE)
-低地址
+- 进程新生与死亡的问题 (之前的proczero诞生后永不死亡)
+
+因此, 本次实验主要关注两个主题: 进程调度 + 生命周期
+
+## 代码组织结构
+
+```
+ECNU-OSLAB-2025-TASK
+├── LICENSE        开源协议
+├── .vscode        配置了可视化调试环境
+├── registers.xml  配置了可视化调试环境
+├── .gdbinit.tmp-riscv xv6自带的调试配置
+├── common.mk      Makefile中一些工具链的定义
+├── Makefile       编译运行整个项目
+├── kernel.ld      定义了内核程序在链接时的布局
+├── pictures       README使用的图片目录 (CHANGE, 日常更新)
+├── README.md      实验指导书 (CHANGE, 日常更新)
+└── src            源码
+    ├── kernel     内核源码
+    │   ├── arch   RISC-V相关
+    │   │   ├── method.h
+    │   │   ├── mod.h
+    │   │   └── type.h
+    │   ├── boot   机器启动
+    │   │   ├── entry.S
+    │   │   └── start.c
+    │   ├── lock   锁机制
+    │   │   ├── spinlock.c
+    │   │   ├── sleeplock.c (TODO, 实现睡眠锁)
+    │   │   ├── method.h (CHANGE)
+    │   │   ├── mod.h (CHANGE, 增加头文件)
+    │   │   └── type.h (CHANGE)
+    │   ├── lib    常用库
+    │   │   ├── cpu.c
+    │   │   ├── print.c
+    │   │   ├── uart.c
+    │   │   ├── utils.c
+    │   │   ├── method.h
+    │   │   ├── mod.h
+    │   │   └── type.h
+    │   ├── mem    内存模块
+    │   │   ├── pmem.c
+    │   │   ├── kvm.c (TODO, kvm_init从单进程内核栈初始化到多进程内核栈初始化)
+    │   │   ├── uvm.c
+    │   │   ├── mmap.c
+    │   │   ├── method.h
+    │   │   ├── mod.h
+    │   │   └── type.h
+    │   ├── trap   陷阱模块
+    │   │   ├── plic.c
+    │   │   ├── timer.c (TODO, 新增timer_wait函数, 增加时钟中断调度逻辑)
+    │   │   ├── trap_kernel.c (TODO, 增加时钟中断调度逻辑)
+    │   │   ├── trap_user.c (TODO, 增加时钟中断调度逻辑)
+    │   │   ├── trap.S
+    │   │   ├── trampoline.S
+    │   │   ├── method.h (CHANGE, 增加timer_wait函数声明)
+    │   │   ├── mod.h
+    │   │   └── type.h
+    │   ├── proc   进程模块
+    │   │   ├── proc.c (TODO, 核心工作)
+    │   │   ├── swtch.S
+    │   │   ├── method.h (CHANGE)
+    │   │   ├── mod.h
+    │   │   └── type.h (CHANGE)
+    │   ├── syscall 系统调用模块
+    │   │   ├── syscall.c (CHANGE, 支持新的系统调用)
+    │   │   ├── sysfunc.c (TODO, 实现新的系统调用)
+    │   │   ├── method.h (CHANGE)
+    │   │   ├── mod.h
+    │   │   └── type.h (CHANGE)
+    │   └── main.c (CHANGE)
+    └── user       用户程序
+        ├── initcode.c (CHANGE)
+        ├── sys.h
+        ├── syscall_arch.h
+        └── syscall_num.h (CHANGE)
 ```
 
-堆不能增长到 `MMAP_BEGIN` 以上，栈不能增长到 `MMAP_END` 以下。mmap 区域独立放置在二者之间，可以创建和释放离散的虚拟地址区间。
+**标记说明**
 
-## 系统调用框架
+**NEW**: 新增源文件, 直接拷贝即可, 无需修改
 
-### 陷入与分发
+**CHANGE**: 旧的源文件发生了更新, 直接拷贝即可, 无需修改
 
-用户程序将系统调用号放入 `a7`，最多六个参数放入 `a0` 到 `a5`，然后执行 `ecall`。寄存器由 trampoline 保存到当前进程的 `trapframe` 中。
+**TODO**: 你需要实现新功能 / 你需要完善旧功能
 
-完整路径如下：
+## 准备工作: 引入进程数组
 
-```text
-U-mode syscall(...)
-  -> ecall
-  -> user_vector
-  -> trap_user_handler()
-  -> syscall()
-  -> syscalls[sys_num]()
-  -> 返回值写入 trapframe->a0
-  -> trap_user_return()
-  -> sret
-```
+首先关注进程结构体的变化 (in `kernel/proc/type.h`), 我们新增了若干字段:
 
-`trap_user_handler()` 识别到 8 号异常后先执行：
+- `char name[16]` 进程名称, 服务于debug
+
+- `spinlock_t lk` 自旋锁, 用于保证共享字段的访问和修改不被打断
+
+- `enum proc_state state` 共享字段1: 进程状态 (共5种), 与生命周期相关
+
+- `struct proc *parent` 共享字段2: 当前进程的父进程, 进程复制过程包含父子关系的建立
+
+- `int exit code` 共享字段3: 进程的退出状态 (类似函数用返回值来代表执行情况)
+
+- `void *sleep_space` 共享字段4: 进程睡眠的位置 / 进程等待的资源 (与sleeping状态相关)
+
+共享字段的含义: 进程B可能会访问/修改进程A的共享字段, 进程A的非共享字段只有自己关心
+
+因此, 为了保证状态访问/修改的原子性, 访问进程共享字段时通常需要先持有自旋锁
+
+我们在`kernel/proc/proc.c`中定义了一个进程数组`proc_list`, 最多支持**N_PROC**个进程同时存在
+
+很自然的, 定义进程数组后, **proczero**将从元素变成指向元素的指针
+
+另外, 进程数组中的每一个进程都应该拥有一个全局的标识符PID, 我们维护一个全局的**global_pid**来支持这一点
+
+`proc_list`和之前遇到的`mmap_mmap_region_node_t node_list[N_MMAP]`都是资源仓库
+
+请你先完成下面三个函数, 实现仓库的有序管理
+
+- `proc_init` 对系统资源(static变量)进行初始化赋值 (其中**global_pid**建议设置为1)
+
+- `proc_alloc` 从资源仓库申请一个空闲的进程结构体, 完成通用初始化逻辑, 上锁返回 (注意: p->ctx.ra应该设置为`proc_return`)
+
+- `proc_free` 向资源仓库释放一个进程结构体(及其包含的资源)
+
+之后, 你需要改写之前的 `proc_make_first`, 主要是以下两点:
+
+- 可以通过`proc_alloc`申请**proczero**, 删去一些不必要的复制
+
+- 只需要完成**proczero**的初始化并解锁即可, 不应直接调用`swtch`逻辑
+
+最后, 在 `kernel/mem/kvm.c`的`kvm_init`中, 需要将内核栈映射从单个拓展到多个
+
+## 基于循环扫描的进程调度
+
+`main`函数做完所有初始化后, 会执行`proc_scheduler`启动调度器, 随后永不返回
+
+因此, 我们可以这样描述CPU-0和CPU-1最初执行流做的事情 (下面称他们为原生进程0和原生进程1):
+
+- 原生进程0和原生进程1从0x80000000开始执行, 经过`entry.S -> start.c -> main.c`进入main函数
+
+- 原生进程0完成了系统资源初始化(包括proczero的准备) + CPU-0核心初始化, 原生进程1完成了CPU-1核心初始化
+
+- 原生进程0和原生进程1进入调度器死循环, 从初始化者变成调度选择与缓冲者
+
+**结合proc_sched和proc_scheduler来说明进程调度的过程:**
+
+- 原生进程执行调度器逻辑(`proc_scheduler`), 循环扫描进程数组, 找到一个处于RUNNABLE状态的用户进程A
+
+- 通过`swtch(原生进程上下文, 用户进程A上下文)`完成第一次执行流切换(`swtch`): 原生进程->用户进程A
+
+- 原生进程A使用`proc_sched`主动/被动释放CPU, 完成第二次执行流切换(`swtch`): 用户进程A->原生进程
+
+- 原生进程继续扫描进程数组, 找到新的处于RUNNABLE状态的用户进程B......
+
+**注意: 当原生进程执行时, CPU->proc设为NULL; 用户进程A执行时, CPU->proc设为用户进程A**
+
+进程调度的算法非常简单, 但是切换逻辑非常严密和精巧, 值得你细细琢磨
+
+仔细考虑调度器在进程调度中的选择与缓冲作用 (用户进程A切换到用户进程B需要两次上下文切换)
+
+理解上述逻辑后请完成 `proc_sched` 和 `proc_scheduler` 函数
+
+## 基于时钟的抢占式调度
+
+完成上面的事情后, 我们发现缺少一种强制性手段来打断长进程的执行, 可能导致排在后面的短进程长时间得不到响应
+
+出于实现简单的考虑, 我们可以在用户态和内核态的时钟中断处理完成后, 强迫当前进程主动交出CPU使用权
+
+请你完成`proc_yield`函数, 并在合适的位置调用它, 将进程的状态从**RUNNING**改为**RUNNABLE**并调用`proc_sched`
+
+做完这些事情, 每个**RUNNABLE**进程相当于持有1个长度为1的时间片, 用完后就要交出CPU使用权, 等待下一次被调度
+
+## 进程状态转换
+
+我们定义了五种进程状态, 从冷到热依次是:
+
+- **unused** 进程已经死亡 / 进程还没初始化, 不持有任何资源
+
+- **zombie** 进程濒临死亡, 不会再有任何活动, 等待父进程回收
+
+- **sleeping** 进程睡眠, 通常是因为尝试获取某种资源但是失败了, 等待被唤醒
+
+- **runnable** 进程准备就绪, 随时可以运行
+
+- **running** 进程正在CPU上执行
+
+下面的图片显示了进程状态的转换过程, 大致可以分成3个部分:
+
+- 如果是短进程 (很快就能完成任务), 它会经历 `unused -> runnable -> running -> zombie -> unused`
+
+- 如果是长进程, 它会在前者的基础上多一些 `runnable -> running -> runnable -> running...` 的调度过程
+
+- 如果更复杂一些, 它会在前者的基础上多一些睡眠和唤醒的过程 `running -> sleeping -> runnable ->...`
+
+![pic](./picture/proc_state.jpg)
+
+## 进程生命周期-1: fork exit wait
+
+首先讨论图中蓝色部分的状态转换
+
+**1. 关于proc_fork--子进程复制**
+
+用户进程的产生只有以下两条路径:
+
+- proczero: 一切都是精心准备和填充的, 有一个自己的`proc_make_first`函数来规定所有细节
+
+- 其他进程: 通过`proc_fork`函数复制和继承父进程的状态
+
+从另一个视角来看, 所有活跃的用户进程构成了一个树形结构, 其中`proczero`是根节点, 比较特别
+
+`proc_fork`的主要工作包括以下几部分:
+
+- 通过`proc_alloc`申请一个空闲的进程结构体
+
+- 复制父进程的一切
+
+- 记录父子关系
+
+- 设置子进程的返回值为0 (便于用户程序区分父进程和子进程)
+
+你可能敏锐地发现了: 假设子进程和父进程毫无关系(两个不同的ELF文件), 完全复制父进程的状态并不合理
+
+我们将在lab-9引入`proc_exec`来解决这个问题, 典型的进程创建路径其实是: `fork` 搭建骨架, `exec` 填充血肉
+
+另一个值得考虑的问题是: 既然`proc_exec`会重新充填血肉, 那很多内存拷贝其实是不必要的
+
+是的, 典型的做法是利用**Page Fault**机制做**懒惰拷贝**, 只设置虚拟内存, 不分配物理内存
+
+我们在用户栈的自动管理中讲过这件事, 但是并没有完全铺开这种模式
+
+你可以参考xv6的相关实验 (lazy allocation) 来优化`proc_fork`的效率, 这里不做要求
+
+**2. 关于proc_exit--进程退出**
+
+进程退出的直观想法是: 调用`proc_free`从**RUNNING**状态直接进入**UNUSED**状态
+
+然而, 就像人无法亲自给自己办葬礼一样, 进程也无法主动杀死自己并回收资源
+
+**回收资源的逻辑不可能由一个已经不存在的进程来执行!**
+
+因此, 参考父进程创建子进程, 我们想到也可以让父进程回收子进程
+
+子进程只需要标记自己进入了**ZOMBIE**状态, 父进程知晓后就会来回收它了
+
+由于进程的树形结构, 还需要考虑一个问题:
+
+如果父进程A先于子进程A1 A2退出了, 谁来负责子进程A1 A2的退出善后呢?
+
+我们注意到`proczero`是一个永不退出的进程, 因此可以将这样的A1 A2"过继给"`proczero`
+
+最后, 子进程进入**ZOMBIE**状态前, 应该设置一个退出状态`exit_code`, 让父进程知道子进程的情况
+
+**3. 关于proc_wait--父进程等待回收子进程**
+
+父进程会循环扫描进程数组, 直到发现自己某个孩子进入**ZOMBIE**状态
+
+随后调用`proc_free`完成子进程的回收释放工作
+
+**4. 一种典型的组合使用方法**
 
 ```c
-p->tf->user_to_kern_epc += 4;
-syscall();
+
+int pid = fork(); // 分支
+if (pid == 0) { // 子进程
+    do_something_1();
+    exit(0); // 退出
+} else { // 父进程
+    int state;
+    wait(&state); // 等待
+    do_something_2();
+}
+
 ```
 
-`sepc` 必须越过当前 `ecall` 指令，否则返回用户态后会重复执行同一次系统调用。
+## 进程生命周期-2: sleep wakeup + 睡眠锁
 
-系统调用分发表将调用号与内核服务函数解耦：
+接下来讨论图中黑色部分加入的影响
+
+首先考虑`proc_wait`不完善的地方:
+
+父进程等待子进程退出的时候, 会便利进程数组, 找不到目标就调用`proc_yield`让出CPU控制权
+
+然而, 让出CPU后父进程还是**RUNNABLE**状态, 随时可能被调度, 这反而耽误子进程的执行
+
+因此, 我们需要在**RUNNABLE**之下再建立一个层级(**SLEEPING**), 这个层级的进程不是无条件执行的, 而是依赖某种资源
+
+- 当进程无法获得这种资源, 就会从**RUNNING**状态进入**SLEEPING**状态, 不可被调度执行
+
+- 当进程可以获得这种资源, 就会从**SLEEPING**状态进入**RUNNABLE**状态, 可以被调度执行
+
+就像当时引入**串口中断**来解决轮询效率低下的问题, 这里引入睡眠态来解决**RUNNABLE**的无效调度问题
+
+- 当父进程调用`proc_wait`时, 遍历一轮后就会执行`proc_sleep`, 将资源设置为自己
+
+- 当子进程调用`proc_exit`时, 会执行`proc_try_wakeup`, 将资源设置为父进程
+
+理解了这部分后, 请实现下面三个函数:
+
+- `proc_sleep` 当前进程睡眠, 等待某种资源
+
+- `proc_wakeup` 唤醒等待某种资源的全部进程
+
+- `proc_try_wakeup` 仅针对唤醒父进程的情况
+
+一个值得思考的问题: `proc_sleep`传入资源的同时为何要传入一把锁, 它起到什么作用?
+
+另一个值得观察的地方: 之前提到进程结构体里有一些字段会被共享访问, 请你找一找哪些地方涉及这样的共享, 以及特例是什么?
+
+完成这部分后, **kernel/proc/proc.c**的工作基本结束了, 请你将目光放到新增加的**kernel/lock/spinlock.c**
+
+我们在自旋锁和进程睡眠唤醒机制的基础上, 建立了睡眠锁这种新的锁类别
+
+- 自旋锁的一致性保证依赖开关中断和原子指令, 获取资源失败时会不断尝试(忙等), 适合保护只被短期持有的资源
+
+- 睡眠锁的一致性保证依赖自旋锁, 获取资源失败后会让当前进程进入睡眠状态, 适合保护会被长期持有的资源
+
+请你完成睡眠锁的相关函数, 它的整体框架与自旋锁是完全一致的, 我们在后面的实验中会用到 (文件系统)
+
+## 相关系统调用
+
+我们在lab-5中已经建立了完善的系统调用流程, 所以功能完成后需要封装成系统调用, 便于在用户空间测试
+
+本次实验新增了以下系统调用
 
 ```c
-static uint64 (*syscalls[])(void) = {
-    [SYS_copyin]    sys_copyin,
-    [SYS_copyout]   sys_copyout,
-    [SYS_copyinstr] sys_copyinstr,
-    [SYS_brk]       sys_brk,
-    [SYS_mmap]      sys_mmap,
-    [SYS_munmap]    sys_munmap,
-};
+uint64 sys_print_str(char *str);   // 打印字符串
+uint64 sys_print_int(int num);     // 打印32位整数
+uint64 sys_getpid();               // 获取当前进程的pid
+uint64 sys_fork();                 // 进程复制
+uint64 sys_wait(uint64 addr);      // 等待子进程退出
+uint64 sys_exit(int exit_code);    // 进程退出
+uint64 sys_sleep(uint64 ntick);    // 进程睡眠ntick个时钟周期
 ```
 
-`arg_uint32()`、`arg_uint64()` 和 `arg_str()` 负责从 `trapframe` 读取参数。服务函数返回的 `uint64` 被写回 `a0`，用户态可以直接取得结果。
+其中前面的6个都比较简单, 这里不做详细说明, 重点介绍一下最后1个
 
-## 用户态与内核态的数据迁移
+这个系统调用的作用是让当前进程睡眠ntick个时钟周期 (默认设置下一个时钟周期大约0.1s)
 
-进入内核后 CPU 已切换到内核页表，用户传入的指针仍是用户虚拟地址，不能直接解引用。因此 `uvm_copyin()`、`uvm_copyout()` 和 `uvm_copyin_str()` 都需要手动查询用户页表。
+它的工作逻辑是:
 
-对于任意一个当前地址，单轮复制步骤为：
+- 让当前时钟以系统时钟sys_timer为资源, 进入睡眠状态
 
-1. 使用 `ALIGN_DOWN(addr, PGSIZE)` 得到当前虚拟页起点。
-2. 使用 `vm_getpte()` 查询叶子 PTE，并检查 `PTE_V`、`PTE_U` 和读写权限。
-3. 通过 `PTE_TO_PA()` 得到物理页地址，再加页内偏移。
-4. 本轮最多复制到当前页末尾，然后进入下一页。
+- 每当发生时钟中断, 系统时钟进行了更新, 就唤醒它执行检查逻辑
 
-关键长度计算如下：
+- 如果发现已经到达了目标时间, 就离开循环; 否则重新进入睡眠状态
+
+实现它的方法:
+
+- 在`timer_update`中增加`proc_wakeup`逻辑
+
+- 完成`timer_wait`函数, 增加`proc_sleep`逻辑, 供`sys_sleep`调用
+
+## 测试用例
+
+以下测试只需要修改**user/initcode.c**
+
+**测试1** (预期结果见**picture/test-1.png**)
 
 ```c
-uint64 va_page = ALIGN_DOWN(src, PGSIZE);
-uint64 offset = src - va_page;
-uint32 n = MIN(len, PGSIZE - offset);
-```
+#include "sys.h"
 
-`copyin` 和 `copyout` 的分页过程对称，但数据方向和权限检查不同：
-
-- `copyin`：用户页复制到内核缓冲区，检查用户页可读。
-- `copyout`：内核缓冲区复制到用户页，检查用户页可写。
-- `copyin_str`：逐字符复制，遇到 NUL 结束，并支持字符串跨页。
-
-## 堆与栈管理
-
-### 用户堆
-
-`sys_brk(new_heap_top)` 支持查询、保持、扩展和收缩四种操作。只有新的堆顶发生跨页变化时才需要修改页表。
-
-堆扩展时映射：
-
-```text
-[ALIGN_UP(old_heap_top), ALIGN_UP(new_heap_top))
-```
-
-堆收缩时解除映射：
-
-```text
-[ALIGN_UP(new_heap_top), ALIGN_UP(old_heap_top))
-```
-
-这里必须向上对齐，因为堆顶表示字节边界。只要堆顶仍位于某一页内部，该页就仍有一部分属于有效堆空间，不能提前释放。
-
-`uvm_heap_grow()` 为新增页面申请用户物理页，并以 `PTE_R | PTE_W | PTE_U` 建立映射；`uvm_heap_ungrow()` 调用 `vm_unmappages(..., true)` 同时清除映射并归还物理页。
-
-### 用户栈
-
-用户栈初始只有一页。当 U-mode 访问尚未映射的栈地址时，会产生：
-
-- 13 号异常：Load Page Fault。
-- 15 号异常：Store/AMO Page Fault。
-
-`trap_user_handler()` 将 `stval` 中的故障地址传给 `uvm_ustack_grow()`。函数首先验证：
-
-```text
-MMAP_END <= fault_addr < old_stack_bottom
-```
-
-之后将故障地址向下对齐，并一次性映射新栈底到旧栈底之间的所有页面：
-
-```c
-uint64 new_bottom = ALIGN_DOWN(fault_addr, PGSIZE);
-
-for(uint64 va = new_bottom; va < old_bottom; va += PGSIZE)
-    // 申请物理页并建立用户可读写映射
-```
-
-这样即使一次访问跨过多个未映射页，也可以直接把栈扩展到目标地址。
-
-## mmap 节点仓库
-
-`mmap_region_t` 描述的是已经分配给进程的虚拟地址区间：
-
-```c
-typedef struct mmap_region
+int main()
 {
-    uint64 begin;
-    uint32 npages;
-    struct mmap_region *next;
-} mmap_region_t;
+	int pid = syscall(SYS_getpid);
+	if (pid == 1) {
+		syscall(SYS_print_str, "\nproczero: hello ");
+		syscall(SYS_print_str, "world!\n");
+	}
+	while (1);
+}
 ```
 
-内核预留 `N_MMAP = 256` 个描述符。每个描述符由 `mmap_region_node_t` 包装：
+**测试2** (预期结果见**picture/test-2.png**)
+
+请在内核代码合适的位置增加提示性输出
 
 ```c
-typedef struct mmap_region_node
+#include "sys.h"
+
+int main()
 {
-    mmap_region_t mmap;
-    struct mmap_region_node *next;
-} mmap_region_node_t;
+	syscall(SYS_print_str, "level-1!\n");
+	syscall(SYS_fork);
+	syscall(SYS_print_str, "level-2!\n");
+	syscall(SYS_fork);
+	syscall(SYS_print_str, "level-3!\n");
+	while(1);
+}
 ```
 
-其中 `mmap.next` 用于进程的已分配 mmap 链表，外层 `next` 用于内核空闲仓库，两者职责不同。
-
-`mmap_init()` 将静态数组 `node_list` 串成初始空闲链。申请时从链首取出节点，释放时使用头插法归还：
+**测试3** (预期结果见**picture/test-3.png**)
 
 ```c
-// alloc
-node = list_head.next;
-list_head.next = node->next;
+#include "sys.h"
 
-// free
-node->next = list_head.next;
-list_head.next = node;
+#define PGSIZE 4096
+#define VA_MAX (1ul << 38)
+#define MMAP_END (VA_MAX - (2 + 16 * 256) * PGSIZE)
+#define MMAP_BEGIN (MMAP_END - 64 * 256 * PGSIZE)
+
+int main()
+{
+	int pid, i;
+	char *str1, *str2, *str3 = "STACK_REGION\n\n";
+	char *tmp1 = "MMAP_REGION\n", *tmp2 = "HEAP_REGION\n";
+
+	str1 = (char*)syscall(SYS_mmap, MMAP_BEGIN, PGSIZE);
+	for (i = 0; tmp1[i] != '\0'; i++)
+		str1[i] = tmp1[i];
+	str1[i] = '\0';
+
+	str2 = (char*)syscall(SYS_brk, 0);
+	syscall(SYS_brk, (long long int)str2 + PGSIZE);
+	for (i = 0; tmp2[i] != '\0'; i++)
+		str2[i] = tmp2[i];
+	str2[i] = '\0';
+
+	syscall(SYS_print_str, "\n--------test begin--------\n");
+	pid = syscall(SYS_fork);
+
+	if (pid == 0) { // 子进程
+		syscall(SYS_print_str, "child proc: hello!\n");
+		syscall(SYS_print_str, str1);
+		syscall(SYS_print_str, str2);
+		syscall(SYS_print_str, str3);
+		syscall(SYS_exit, 1234);
+	} else { // 父进程
+		int exit_state = 0;
+		syscall(SYS_wait, &exit_state);
+		syscall(SYS_print_str, "parent proc: hello!\n");
+		syscall(SYS_print_int, pid);
+		if (exit_state == 1234)
+			syscall(SYS_print_str, "good boy!\n");
+		else
+			syscall(SYS_print_str, "bad boy!\n");
+	}
+
+	syscall(SYS_print_str, "--------test end----------\n");
+
+	while (1);
+
+	return 0;
+}
 ```
 
-每次申请和释放都由 `list_lk` 自旋锁保护，因此两个 CPU 可以并发使用仓库而不会破坏链表。
+**测试4** (预期结果见**picture/test-4.png**)
 
-需要注意，测试代码中的两个 `N_MMAP / 2` 切分的是 `mmap_list` 指针数组，而不是固定切分 `node_list` 的下标。锁只覆盖一次申请，不覆盖整个 128 次循环，所以两个 CPU 得到的节点下标可能交错。每个 CPU 的申请子序列仍然递增；按原顺序头插归还后，最终输出中对应的子序列递减。
-
-## mmap 与 munmap
-
-### mmap
-
-`sys_mmap(begin, len)` 检查长度和地址的页对齐、mmap 边界以及整数范围，然后调用 `uvm_mmap()`。为了让 `begin == 0` 时的自动选址结果能返回用户态，`uvm_mmap()` 返回最终映射起点。
-
-指定起点时，函数在有序链表中找到插入位置，并检查它与前后节点不重叠。自动选址时，`uvm_mmap_find()` 从 `MMAP_BEGIN` 开始执行 first-fit 扫描，返回第一个足够大的空隙。
-
-插入新节点后，需要分别检查它是否与前驱、后继相邻：
-
-```text
-前驱相邻  -> 合并前驱和新节点
-后继相邻  -> 合并当前节点和后继
-两侧相邻  -> 最终三个区间合并为一个
-```
-
-链表整理完成后，再逐页申请物理页并建立 `PTE_R | PTE_W | PTE_U` 映射。
-
-### munmap
-
-`uvm_munmap()` 要求释放范围完整包含在一个已分配节点内。根据释放区间和原节点的关系分为四种情况：
-
-| 情况 | 链表处理 |
-| --- | --- |
-| 完整覆盖节点 | 从链表删除节点，并归还描述符 |
-| 删除节点前部 | 增大 `begin`，减少 `npages` |
-| 删除节点后部 | 保持 `begin`，减少 `npages` |
-| 删除节点中部 | 原节点保留左段，申请新节点描述右段 |
-
-链表更新后，`vm_unmappages(..., true)` 负责清除对应 PTE 并释放用户物理页。
-
-## 页表复制与销毁
-
-### 深复制
-
-`uvm_copy_pgtbl()` 不复制三级页表页本身的布局，而是按照进程地址空间中实际有效的区域逐页复制：
-
-1. `USER_BASE` 开始的一页代码和数据。
-2. `USER_BASE + PGSIZE` 到 `ALIGN_UP(heap_top)` 的堆。
-3. mmap 链表描述的所有离散区域。
-4. `TRAPFRAME - ustack_npage * PGSIZE` 到 `TRAPFRAME` 的用户栈。
-
-`copy_range()` 对每个源叶子 PTE 执行：
+请在内核代码合适的位置增加提示性输出
 
 ```c
-uint64 old_pa = PTE_TO_PA(*pte);
-int flags = PTE_FLAGS(*pte);
-uint64 new_pa = (uint64)pmem_alloc(false);
+#include "sys.h"
 
-memmove((void *)new_pa, (void *)old_pa, PGSIZE);
-vm_mappages(new, va, new_pa, PGSIZE, flags);
+int main()
+{
+	int pid = syscall(SYS_fork);
+	if (pid == 0) {
+		syscall(SYS_print_str, "Ready to sleep!\n");
+		syscall(SYS_sleep, 30);
+		syscall(SYS_print_str, "Ready to exit!\n");
+		syscall(SYS_exit, 0);
+	} else {
+		syscall(SYS_wait, 0);
+		syscall(SYS_print_str, "Child exit!\n");
+	}
+	while(1);
+}
 ```
 
-因此新旧页表中的虚拟地址和权限一致，但映射到不同的用户物理页，修改副本不会影响源页表。
+**温馨提示:**
 
-`TRAPFRAME` 和 `TRAMPOLINE` 不在该函数中复制。新进程的页表应事先通过 `proc_pgtbl_init()` 建立自己的 trapframe 映射和共享的 trampoline 映射。
+- 测试前, 请先理解以上测试用例在测试什么, 并对测试结果有一个预期
 
-### 递归销毁
+- 尽量多补充一些其他测试用例以验证代码的正确性
 
-`destroy_pgtbl(pgtbl, level)` 遍历当前页表的512个 PTE：
+**尾声**
 
-- 无效 PTE 直接跳过。
-- `R/W/X` 全为0的有效 PTE 指向下一级页表，递归销毁。
-- 叶子 PTE 指向用户物理页，归还到 `user_region`。
-- 当前层遍历结束后，将页表页归还到 `kern_region`。
+第二阶段, 我们围绕进程管理的主题, 基于一阶段构建的基础设施
 
-正式递归前还需要特殊处理两个高地址映射：
+从一到多, 从易到难地构建了进程管理模块, 同时完善和加强了**lock | mem | syscall | trap**模块
 
-- `TRAPFRAME` 每个进程独有，但它由 `pmem_alloc(true)` 从内核区分配，因此先只解除映射，再通过 `pmem_free(pa, true)` 释放。
-- `TRAMPOLINE` 被所有进程共享，只解除映射，不能释放其物理页。
+截至lab-6, **进程管理**和**内存管理**的主要内容已经相对完善了
 
-## 测试方法与结果
+但是还有一个大问题没有解决: 只有CPU和内存的操作系统, 掉电后就什么都不剩了......
 
-所有测试均使用以下命令构建并运行：
+我们将在第三阶段(lab-7到lab-9)引入磁盘这种关键外设, 它可以在断电的情况下保存数据
 
-```bash
-make -B build
-make run
-```
+最重要的, 我们将**基于磁盘自底向上地构建文件系统**, 并赋能内存管理和进程管理模块
 
-### Test 1：用户态与内核态数据迁移
-
-用户态先通过 `SYS_copyout` 得到内核数组，再通过 `SYS_copyin` 传回内核；字符串通过 `SYS_copyinstr` 复制。输出中的 `1 2 3 4 5` 和 `hello, world` 说明三条复制路径均正确。
-
-![Test 1](picture/test1.png)
-
-### Test 2：用户堆伸缩
-
-测试依次查询堆顶、增长9页、保持不变，再收缩5页。页表输出显示初始堆顶为 `0x2000`，增长后映射到第10号虚拟页，收缩后仅保留第2到第5号堆页。
-
-<table>
-  <tr>
-    <td><img src="picture/test2(1).png" alt="Test 2 heap grow"></td>
-    <td><img src="picture/test2(2).png" alt="Test 2 heap shrink"></td>
-  </tr>
-</table>
-
-### Test 3：用户栈自动增长
-
-测试中的局部数组跨越多页。第一次写入使栈从1页增长到2页，第二次访问更低地址使栈从2页一次增长到5页；随后内核分别正确读取 `hello` 和 `world`。
-
-![Test 3](picture/test3.png)
-
-### Test 4：mmap 描述符仓库并发
-
-初始化后，空闲链表按 `0 -> 255` 排列。两个 CPU 各申请并归还128个节点，最终仍能遍历到全部256个下标。
-
-本次运行中最终链表包含从 `255` 和 `222` 开始的两条交错递减子序列。这是两个 CPU 在申请阶段交错取得节点的结果，不影响正确性；关键条件是 `0...255` 每个下标恰好出现一次，没有丢失或重复。
-
-<table>
-  <tr>
-    <td><img src="picture/test4(1).png" alt="Test 4 initial node list"></td>
-    <td><img src="picture/test4(2).png" alt="Test 4 concurrent free result"></td>
-  </tr>
-</table>
-
-### Test 5：mmap 与 munmap
-
-以 `B = MMAP_BEGIN`、`P = PGSIZE` 表示 mmap 区域起点和页大小，测试过程中的已分配区间变化如下：
-
-| 操作 | 操作后的 mmap 链表 |
-| --- | --- |
-| `mmap(B+4P, 3P)` | `[B+4P, B+7P)` |
-| `mmap(B+10P, 2P)` | 上一段及 `[B+10P, B+12P)` |
-| `mmap(B+2P, 2P)` | `[B+2P, B+7P)`、`[B+10P, B+12P)` |
-| `mmap(B+12P, P)` | 第二段扩展为 `[B+10P, B+13P)` |
-| `mmap(B+7P, 3P)` | 两段连接并合并为 `[B+2P, B+13P)` |
-| `mmap(B, 2P)` | 合并为 `[B, B+13P)` |
-| `mmap(0, 10P)` | first-fit 后合并为 `[B, B+23P)` |
-| `munmap(B+10P, 5P)` | `[B, B+10P)`、`[B+15P, B+23P)` |
-| `munmap(B, 10P)` | `[B+15P, B+23P)` |
-| `munmap(B+17P, 2P)` | `[B+15P, B+17P)`、`[B+19P, B+23P)` |
-| 后续四次 `munmap` | 依次缩短并删除剩余区间，最终为空 |
-
-截图同时展示了 mmap 链表和对应页表，能够看到合并时描述符减少、拆分时描述符增加，以及 munmap 后物理页映射消失。
-
-<table>
-  <tr>
-    <td><img src="picture/test5(1).png" alt="Test 5 step 1"></td>
-    <td><img src="picture/test5(2).png" alt="Test 5 step 2"></td>
-  </tr>
-  <tr>
-    <td><img src="picture/test5(3).png" alt="Test 5 step 3"></td>
-    <td><img src="picture/test5(4).png" alt="Test 5 step 4"></td>
-  </tr>
-  <tr>
-    <td><img src="picture/test5(5).png" alt="Test 5 step 5"></td>
-    <td><img src="picture/test5(6).png" alt="Test 5 step 6"></td>
-  </tr>
-  <tr>
-    <td><img src="picture/test5(7).png" alt="Test 5 step 7"></td>
-    <td><img src="picture/test5(8).png" alt="Test 5 step 8"></td>
-  </tr>
-  <tr>
-    <td><img src="picture/test5(9).png" alt="Test 5 step 9"></td>
-    <td><img src="picture/test5(10).png" alt="Test 5 step 10"></td>
-  </tr>
-  <tr>
-    <td><img src="picture/test5(11).png" alt="Test 5 final empty list"></td>
-    <td></td>
-  </tr>
-</table>
-
-最终输出：
-
-```text
-alloced mmap_space:
-empty
-```
-
-说明所有 mmap 描述符、页表映射和用户物理页均已正确释放。
-
-### Test 6：页表复制与销毁
-
-该项为自行设计测试。测试临时构造包含以下内容的源页表：
-
-- 一页代码。
-- 两页堆。
-- 两段 mmap，共三页。
-- 三页用户栈。
-
-复制后逐页比较源和副本：
-
-- 虚拟地址和 PTE 权限一致。
-- 页面内容一致。
-- `old pa` 与 `new pa` 均不相同。
-
-随后修改副本中的代码页，确认源页不变；销毁副本后再次读取源页表，确认源页表仍然有效；最后销毁源页表。测试没有触发 panic，并输出全部检查通过。
-
-![Test 6](picture/test6.png)
-
-## 实验总结
-
-本次实验把 Lab 4 中单一的 `helloworld` 调用扩展成了完整的系统调用分发和参数传递框架，并让 `proczero` 具备了基本的动态地址空间管理能力。
-
-实验中几个关键认识如下：
-
-- 用户指针只能结合用户页表解释，内核不能在切换页表后直接解引用。
-- 页表管理必须同时考虑虚拟区间、叶子映射、物理页和中间页表页四个层次。
-- 堆顶是字节边界，而物理内存按页管理，因此扩展和收缩需要采用正确的向上对齐边界。
-- 自旋锁保证单次仓库操作的原子性，但不会固定两个 CPU 获得节点的连续范围。
-- mmap 描述符记录逻辑虚拟区间，真正的可访问性仍由页表映射决定，两者必须同步更新。
-- 页表深复制必须重新分配叶子物理页；销毁时必须区分用户页、内核分配的 trapframe 和共享 trampoline。
-
-至此，内核已经具备系统调用参数传递、堆栈增长、离散映射以及地址空间复制和回收能力，为下一实验引入多进程奠定了基础。
+**欢迎来到文件系统的世界!**
