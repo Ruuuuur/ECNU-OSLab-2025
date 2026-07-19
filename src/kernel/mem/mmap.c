@@ -8,20 +8,61 @@ static spinlock_t list_lk;
 // 初始化上述三个数据结构
 void mmap_init()
 {
+    spinlock_init(&list_lk, "mmap_region");
 
+    list_head.next = &node_list[0];
+
+    for(int i = 0; i < N_MMAP; ++i){
+        node_list[i].mmap.begin = 0;
+        node_list[i].mmap.npages = 0;
+        node_list[i].mmap.next = NULL;
+
+        if(i + 1 < N_MMAP){
+            node_list[i].next = &node_list[i + 1];
+        }else{
+            node_list[i].next = NULL;
+        }
+    }
 }
 
 // 从仓库申请一个 mmap_region_t
 // 若仓库空了则 panic
 mmap_region_t *mmap_region_alloc()
 {
+    spinlock_acquire(&list_lk);
 
+    mmap_region_node_t *node = list_head.next;
+    assert(node != NULL, "mmap_region_alloc: no free node");
+
+    list_head.next = node->next;
+    node->next = NULL;
+
+    node->mmap.begin = 0;
+    node->mmap.npages = 0;
+    node->mmap.next = NULL;
+
+    spinlock_release(&list_lk);
+
+    return &node->mmap;
 }
 
 // 向仓库归还一个 mmap_region_t
 void mmap_region_free(mmap_region_t *mmap)
 {
+    assert(mmap != NULL, "mmap_region_free: NULL");
 
+    mmap_region_node_t *node = (mmap_region_node_t *)mmap;
+
+    spinlock_acquire(&list_lk);
+
+    node->mmap.begin = 0;
+    node->mmap.npages = 0;
+    node->mmap.next = NULL;
+
+    node->next = list_head.next;
+    list_head.next = node;
+
+    spinlock_release(&list_lk);
 }
 
 // 输出可用的 mmap_region_node_t 链

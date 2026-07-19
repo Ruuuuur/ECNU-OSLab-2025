@@ -12,16 +12,18 @@ int main()
     if(cpuid == 0){
         print_init();
         pmem_init();
+        mmap_init();
         kvm_init();
         kvm_inithart();
         trap_kernel_init();
         trap_kernel_inithart();
-        proc_make_first();
+
         printf("cpu %d is booting!\n", cpuid);
 
         __sync_synchronize();
-
         started = 1;
+
+        proc_make_first();
     }else{
         while(started == 0)
             ;
@@ -29,6 +31,7 @@ int main()
         __sync_synchronize();
         kvm_inithart();
         trap_kernel_inithart();
+
         printf("cpu %d is booting!\n", cpuid);
     }
 

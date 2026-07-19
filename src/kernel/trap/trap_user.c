@@ -31,7 +31,7 @@ void trap_user_handler()
 
     int trap_id = scause & 0xf;
 
-    if(scause & 0x8000000000000000ul) {
+    if(scause & 0x8000000000000000ul) { //中断
         switch(trap_id){
 
         case 1:
@@ -41,26 +41,36 @@ void trap_user_handler()
         case 9:
             external_interrupt_handler();
             break;
-
         default:
             printf("\nunexpected interrupt: %s\n", interrupt_info[trap_id]);
             printf("trap_id = %d, sepc = %p, stval = %p\n", trap_id, sepc, stval);
             panic("trap_user_handler");
         }
-    }else{
+    }else{ //异常
         switch(trap_id){
 
         case 8:
             p->tf->user_to_kern_epc += 4;
-
-            if(p->tf->a7 == SYS_helloworld){
-                printf("proczero: hello world!\n");
-                p->tf->a0 = 0;
-            }else{
-                printf("unknown syscall: %d\n", p->tf->a7);
-                p->tf->a0 = -1;
-            }
+            syscall();
             break;
+        case 13:
+        case 15:
+        {
+            uint64 old_npage = p->ustack_npage;
+            uint64 new_npage = uvm_ustack_grow(
+                p->pgtbl,
+                old_npage,
+                stval
+            );
+
+            if(new_npage == (uint64)-1){
+                printf("invalid stack page fault: %p\n", stval);
+                panic("trap_user_handler: stack grow failed");
+            }
+
+            p->ustack_npage = new_npage;
+            break;
+        }
 
         default:
             printf("\nunexpected exception: %s\n", exception_info[trap_id]);

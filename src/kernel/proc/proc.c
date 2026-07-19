@@ -52,7 +52,7 @@ void proc_make_first()
     memset(p, 0, sizeof(proc_t));
 
     p->pid = 0;
-
+    p->mmap = NULL;
     p->tf = (trapframe_t *)pmem_alloc(true);
     p->pgtbl = proc_pgtbl_init((uint64)p->tf);
 
