@@ -1,4 +1,5 @@
 #include "mod.h"
+#include "../proc/method.h"
 #include "../../user/syscall_num.h"
 // in trampoline.S
 extern char trampoline[];  // 内核和用户切换的代码
@@ -36,6 +37,7 @@ void trap_user_handler()
 
         case 1:
             timer_interrupt_handler(); 
+            proc_yield();
             break;
 
         case 9:

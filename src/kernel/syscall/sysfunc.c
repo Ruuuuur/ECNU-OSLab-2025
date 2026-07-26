@@ -1,5 +1,6 @@
 #include "mod.h"
-
+#include "../proc/method.h"
+#include "../trap/method.h"
 /*
     用户堆空间伸缩
     uint64 new_heap_top (如果是0, 代表查询当前堆顶位置)
@@ -125,7 +126,12 @@ uint64 sys_munmap()
 */
 uint64 sys_print_str()
 {
+    char buf[STR_MAXLEN];
 
+    arg_str(0, buf, STR_MAXLEN);
+    printf("%s", buf);
+
+    return 0;
 }
 
 /*
@@ -135,7 +141,12 @@ uint64 sys_print_str()
 */
 uint64 sys_print_int()
 {
+    uint32 num;
 
+    arg_uint32(0, &num);
+    printf("num = %d\n", (int)num);
+
+    return 0;
 }
 
 /*
@@ -144,7 +155,7 @@ uint64 sys_print_int()
 */
 uint64 sys_fork()
 {
-
+    return proc_fork();
 }
 
 /*
@@ -153,7 +164,11 @@ uint64 sys_fork()
 */
 uint64 sys_wait()
 {
+    uint64 user_addr;
 
+    arg_uint64(0, &user_addr);
+
+    return proc_wait(user_addr);
 }
 
 /*
@@ -163,7 +178,14 @@ uint64 sys_wait()
 */
 uint64 sys_exit()
 {
+    uint32 exit_code;
 
+    arg_uint32(0, &exit_code);
+
+    proc_exit((int)exit_code);
+
+    panic("sys_exit: proc_exit returned");
+    return -1;
 }
 
 /*
@@ -173,7 +195,12 @@ uint64 sys_exit()
 */
 uint64 sys_sleep()
 {
+    uint32 ntick;
 
+    arg_uint32(0, &ntick);
+    timer_wait(ntick);
+
+    return 0;
 }
 
 /*
@@ -181,5 +208,10 @@ uint64 sys_sleep()
 */
 uint64 sys_getpid()
 {
+    proc_t *p = myproc();
 
+    assert(p != NULL,
+        "sys_getpid: no current process");
+
+    return p->pid;
 }

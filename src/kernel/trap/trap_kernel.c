@@ -1,5 +1,5 @@
 #include "mod.h"
-
+#include "../proc/method.h"
 // 中断信息
 char *interrupt_info[16] = {
     "U-mode software interrupt",      // 0
@@ -90,7 +90,12 @@ void trap_kernel_handler()
         {
         case 1:
             timer_interrupt_handler();
+
+            if(myproc() != NULL){
+                proc_yield();
+            }
             break;
+
         case 9:
             external_interrupt_handler();
             break;

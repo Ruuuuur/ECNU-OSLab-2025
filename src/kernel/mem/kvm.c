@@ -107,8 +107,17 @@ void kvm_init()
 
     vm_mappages(kernel_pgtbl, TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
 
-    void *kstack = pmem_alloc(true);
-    vm_mappages(kernel_pgtbl, KSTACK(0), (uint64)kstack, PGSIZE, PTE_R | PTE_W);
+    for(int i = 0; i < N_PROC; ++i){
+        void *kstack = pmem_alloc(true);
+
+        vm_mappages(
+            kernel_pgtbl,
+            KSTACK(i),
+            (uint64)kstack,
+            PGSIZE,
+            PTE_R | PTE_W
+        );
+    }
 }
 
 // 每个CPU都需要调用, 从不使用页表切换到使用内核页表

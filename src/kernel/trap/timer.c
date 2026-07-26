@@ -1,5 +1,5 @@
 #include "mod.h"
-
+#include "../proc/method.h"
 /*-------------------- 工作在M-mode --------------------*/
 
 // in trap.S M-mode时钟中断处理流程()
@@ -54,6 +54,7 @@ void timer_update()
 {
     spinlock_acquire(&sys_timer.lk);
     sys_timer.ticks++;
+    proc_wakeup(&sys_timer);
     spinlock_release(&sys_timer.lk);
 }
 
@@ -72,5 +73,13 @@ uint64 timer_get_ticks()
 // 让进程睡眠ntick个时钟周期
 void timer_wait(uint64 ntick)
 {
+    spinlock_acquire(&sys_timer.lk);
 
+    uint64 start = sys_timer.ticks;
+
+    while(sys_timer.ticks - start < ntick){
+        proc_sleep(&sys_timer, &sys_timer.lk);
+    }
+
+    spinlock_release(&sys_timer.lk);
 }
