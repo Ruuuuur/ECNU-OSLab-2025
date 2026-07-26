@@ -156,7 +156,7 @@ while(1)
 
 ![测试 1](picture/test1.png)
 
-截图显示两个 CPU 正常启动，并由 `proczero` 输出 `hello world!`。
+**结果分析：** 两个 CPU 均完成启动，且仅 PID 为 1 的 `proczero` 输出欢迎信息。这说明 `sys_getpid()` 能正确取得当前进程，用户字符串地址能够经 `arg_str()` 和 `uvm_copyin_str()` 按当前用户页表复制到内核，再由 `sys_print_str()` 输出。
 
 ### 测试 2：两次 `fork`
 
@@ -175,6 +175,8 @@ while(1)
 ```
 
 ![测试 2](picture/test2.png)
+
+**结果分析：** 截图中 `level-1!`、`level-2!`、`level-3!` 分别出现 1、2、4 次，进程 PID 从 1 扩展到 4。每个进程在第二次 `fork` 后都拥有独立的后续执行流，因此输出数量按 2 倍增长。不同 PID 的运行顺序交错是双 CPU 与时钟抢占调度的正常结果，不影响 fork 的正确性。
 
 ### 测试 3：地址空间复制、退出与回收
 
@@ -224,6 +226,8 @@ syscall(SYS_print_str, "--------test end----------\n");
 
 ![测试 3](picture/test3.png)
 
+**结果分析：** 子进程成功输出 mmap 区、堆区和用户栈中的三个字符串，说明 `uvm_copy_pgtbl()` 复制了相应用户页，且 mmap 描述符链表也被正确复制。父进程在 `wait` 后得到 `num = 2`，并根据用户地址空间中收到的退出码输出 `good boy!`，验证了 `fork` 的父子返回值、`exit` 的 `ZOMBIE` 状态、`uvm_copyout()` 传递退出码以及 `proc_free()` 的回收路径。
+
 ### 测试 4：定时睡眠与唤醒
 
 子进程请求睡眠 30 个 tick。调试输出显示它在每次 tick 后被唤醒检查、未到目标时再次睡眠；到达目标后输出 `Ready to exit!`，父进程随后被 `wait` 唤醒并输出 `Child exit!`。
@@ -247,6 +251,8 @@ while(1)
 ```
 
 ![测试 4](picture/test4.png)
+
+**结果分析：** PID 2 在等待期间反复进入睡眠，达到 30 个 tick 后才输出 `Ready to exit!`，说明 `timer_wait()` 会在每次被时钟唤醒后重新检查计时条件，而不会忙等。子进程退出后，等待子进程的 PID 1 被唤醒并输出 `Child exit!`，验证了 `proc_sleep()` 的锁交接、`proc_wakeup()` 的按通道唤醒以及 `proc_try_wakeup()` 的父进程唤醒逻辑。
 
 ## 总结
 
