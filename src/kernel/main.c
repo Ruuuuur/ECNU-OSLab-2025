@@ -3,6 +3,7 @@
 #include "mem/mod.h"
 #include "trap/mod.h"
 #include "proc/mod.h"
+#include "fs/mod.h"
 
 volatile static int started = 0;
 
@@ -19,6 +20,7 @@ int main()
         kvm_init();
         kvm_inithart();
         mmap_init();
+        virtio_disk_init();
         proc_init();
         proc_make_first();
         trap_kernel_init();

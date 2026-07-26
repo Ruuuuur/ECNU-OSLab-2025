@@ -1,6 +1,7 @@
 #include "mod.h"
 #include "../proc/method.h"
 #include "../trap/method.h"
+#include "../fs/mod.h"
 /*
     用户堆空间伸缩
     uint64 new_heap_top (如果是0, 代表查询当前堆顶位置)
@@ -214,4 +215,99 @@ uint64 sys_getpid()
         "sys_getpid: no current process");
 
     return p->pid;
+}
+
+/*
+    从 data_bitmap 申请一个 block
+    返回 block 序号
+*/
+uint64 sys_alloc_block()
+{
+
+}
+
+/*
+    向 data_bitmap 释放一个 block
+    uint32 block_num
+*/
+uint64 sys_free_block()
+{
+
+}
+
+/*
+    从 inode_bitmap 申请一个 inode
+    返回 inode 序号
+*/
+uint64 sys_alloc_inode()
+{
+
+}
+
+/*
+    向 inode_bitmap 释放一个 inode
+    uint32 inode_num
+*/
+uint64 sys_free_inode()
+{
+
+}
+
+/*
+    输出目标 bitmap 的状态
+    uint32 choose_bitmap (0: data, 1: inode)
+*/
+uint64 sys_show_bitmap()
+{
+
+}
+
+/*
+    获取一个描述 block 的 buffer
+    uint32 block_num
+*/
+uint64 sys_get_block()
+{
+
+}
+
+/*
+    释放一个 buffer
+    uint64 addr_buf
+*/
+uint64 sys_put_block()
+{
+
+}
+
+/*
+    将 buffer 中的数据复制到用户空间
+    uint64 addr_buf
+    uint64 addr_data
+*/
+uint64 sys_read_block()
+{
+
+}
+
+/*
+    将用户空间数据写入 buffer 并同步到磁盘
+    uint64 addr_buf
+    uint64 addr_data
+*/
+uint64 sys_write_block()
+{
+
+}
+
+/* 输出 buffer 链表状态 */
+uint64 sys_show_buffer()
+{
+
+}
+
+/* 释放非活跃 buffer 持有的物理页 */
+uint64 sys_flush_buffer()
+{
+
 }
