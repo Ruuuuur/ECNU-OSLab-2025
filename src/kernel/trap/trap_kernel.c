@@ -1,5 +1,7 @@
 #include "mod.h"
 #include "../proc/method.h"
+#include "../fs/type.h"
+#include "../fs/method.h"
 // 中断信息
 char *interrupt_info[16] = {
     "U-mode software interrupt",      // 0
@@ -124,6 +126,8 @@ void external_interrupt_handler()
 
     if(irq == UART_IRQ){
         uart_intr();
+    }else if(irq == VIRTIO_IRQ){
+        virtio_disk_intr();
     }else if(irq){
         printf("unexpected external interrupt irq = %d\n", irq);
     }

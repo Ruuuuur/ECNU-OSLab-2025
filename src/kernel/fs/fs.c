@@ -22,5 +22,18 @@ static void sb_print()
 /* 文件系统初始化 */
 void fs_init()
 {
+	buffer_init();
 
+    buffer_t *buf = buffer_get(FS_SB_BLOCK);
+
+    memmove(&sb, buf->data, sizeof(sb));
+
+    buffer_put(buf);
+
+    assert(sb.magic_num == FS_MAGIC,
+        "fs_init: invalid superblock");
+    assert(sb.block_size == BLOCK_SIZE,
+        "fs_init: invalid block size");
+
+    sb_print();
 }

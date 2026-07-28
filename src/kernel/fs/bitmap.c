@@ -8,7 +8,27 @@ extern super_block_t sb;
 */
 static uint32 bitmap_search_and_set(uint32 bitmap_block_num, uint32 valid_count)
 {
+    assert(valid_count <= BIT_PER_BLOCK,
+        "bitmap_search_and_set: invalid count");
 
+    buffer_t *buf = buffer_get(bitmap_block_num);
+
+    for(uint32 index = 0; index < valid_count; index++){
+        uint32 byte = index / BIT_PER_BYTE;
+        uint32 shift = index % BIT_PER_BYTE;
+        uint8 mask = (uint8)(1U << shift);
+
+        if((buf->data[byte] & mask) == 0){
+            buf->data[byte] |= mask;
+
+            buffer_write(buf);
+            buffer_put(buf);
+            return index;
+        }
+    }
+
+    buffer_put(buf);
+    return (uint32)-1;
 }
 
 /*
@@ -16,7 +36,22 @@ static uint32 bitmap_search_and_set(uint32 bitmap_block_num, uint32 valid_count)
 */
 static void bitmap_clear(uint32 bitmap_block_num, uint32 index)
 {
+    assert(index < BIT_PER_BLOCK,
+        "bitmap_clear: invalid index");
 
+    buffer_t *buf = buffer_get(bitmap_block_num);
+
+    uint32 byte = index / BIT_PER_BYTE;
+    uint32 shift = index % BIT_PER_BYTE;
+    uint8 mask = (uint8)(1U << shift);
+
+    assert(buf->data[byte] & mask,
+        "bitmap_clear: bit already clear");
+
+    buf->data[byte] &= (uint8)~mask;
+
+    buffer_write(buf);
+    buffer_put(buf);
 }
 
 /*
@@ -25,7 +60,27 @@ static void bitmap_clear(uint32 bitmap_block_num, uint32 index)
 */
 uint32 bitmap_alloc_block()
 {
+    for(uint32 block = 0;
+        block < sb.data_bitmap_blocks;
+        block++){
 
+        uint32 base = block * BIT_PER_BLOCK;
+        uint32 valid_count = sb.data_blocks - base;
+
+        if(valid_count > BIT_PER_BLOCK)
+            valid_count = BIT_PER_BLOCK;
+
+        uint32 local_index = bitmap_search_and_set(
+            sb.data_bitmap_firstblock + block,
+            valid_count
+        );
+
+        if(local_index != (uint32)-1){
+            return sb.data_firstblock + base + local_index;
+        }
+    }
+
+    return (uint32)-1;
 }
 
 /*
@@ -34,19 +89,60 @@ uint32 bitmap_alloc_block()
 */
 uint32 bitmap_alloc_inode()
 {
+    for(uint32 block = 0;
+        block < sb.inode_bitmap_blocks;
+        block++){
 
+        uint32 base = block * BIT_PER_BLOCK;
+        uint32 valid_count = sb.total_inodes - base;
+
+        if(valid_count > BIT_PER_BLOCK)
+            valid_count = BIT_PER_BLOCK;
+
+        uint32 local_index = bitmap_search_and_set(
+            sb.inode_bitmap_firstblock + block,
+            valid_count
+        );
+
+        if(local_index != (uint32)-1){
+            return base + local_index;
+        }
+    }
+
+    return (uint32)-1;
 }
 
 /* 释放一个block, 将data_bitmap对应bit设为0 */
 void bitmap_free_block(uint32 block_num)
 {
+    assert(block_num >= sb.data_firstblock &&
+            block_num < sb.data_firstblock + sb.data_blocks,
+        "bitmap_free_block: invalid block number");
 
+    uint32 relative = block_num - sb.data_firstblock;
+
+    uint32 bitmap_block_num =
+        sb.data_bitmap_firstblock +
+        relative / BIT_PER_BLOCK;
+
+    uint32 local_index = relative % BIT_PER_BLOCK;
+
+    bitmap_clear(bitmap_block_num, local_index);
 }
 
 /* 释放一个inode, 将inode_bitmap对应bit设为0 */
 void bitmap_free_inode(uint32 inode_num)
 {
+    assert(inode_num < sb.total_inodes,
+        "bitmap_free_inode: invalid inode number");
 
+    uint32 bitmap_block_num =
+        sb.inode_bitmap_firstblock +
+        inode_num / BIT_PER_BLOCK;
+
+    uint32 local_index = inode_num % BIT_PER_BLOCK;
+
+    bitmap_clear(bitmap_block_num, local_index);
 }
 
 /* 打印某个bitmap中所有分配出去的bit */

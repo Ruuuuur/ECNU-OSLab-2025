@@ -1,5 +1,5 @@
 #include "mod.h"
-
+#include "../fs/type.h"
 extern char trampoline[];
 // 内核页表
 static pgtbl_t kernel_pgtbl;
@@ -10,6 +10,9 @@ static pgtbl_t kernel_pgtbl;
 // 提示：使用 VA_TO_VPN + PTE_TO_PA + PA_TO_PTE
 pte_t *vm_getpte(pgtbl_t pgtbl, uint64 va, bool alloc)
 {
+    if(pgtbl == NULL){
+        pgtbl = kernel_pgtbl;
+    }
     assert(va < VA_MAX, "vm_getpte: va too large");
 
     for(int level = 2; level > 0; level--){
@@ -92,20 +95,53 @@ void kvm_init()
 {
     kernel_pgtbl = (pgtbl_t)pmem_alloc(true);
     memset(kernel_pgtbl, 0, PGSIZE);
+    vm_mappages(
+        kernel_pgtbl,
+        VIRTIO_BASE,
+        VIRTIO_BASE,
+        PGSIZE,
+        PTE_R | PTE_W
+    );
 
-    vm_mappages(kernel_pgtbl, UART_BASE, UART_BASE, PGSIZE, PTE_R | PTE_W);
+    vm_mappages(kernel_pgtbl,
+        UART_BASE,
+        UART_BASE,
+        PGSIZE,
+        PTE_R | PTE_W
+    );
     
-    vm_mappages(kernel_pgtbl, CLINT_BASE, CLINT_BASE, 0x10000, PTE_R | PTE_W); //size = 64kb
+    vm_mappages(kernel_pgtbl,
+        CLINT_BASE,
+        CLINT_BASE,
+        0x10000,
+        PTE_R | PTE_W
+    ); //size = 64kb
     
-    vm_mappages(kernel_pgtbl, PLIC_BASE, PLIC_BASE, 0x400000, PTE_R | PTE_W); //size = 4mb
+    vm_mappages(kernel_pgtbl,
+        PLIC_BASE, PLIC_BASE,
+        0x400000,
+        PTE_R | PTE_W
+    ); //size = 4mb
     
-    vm_mappages(kernel_pgtbl, KERNEL_BASE, KERNEL_BASE,
-        (uint64)KERNEL_DATA - KERNEL_BASE, PTE_R | PTE_X);
+    vm_mappages(kernel_pgtbl,
+        KERNEL_BASE,
+        KERNEL_BASE,
+        (uint64)KERNEL_DATA - KERNEL_BASE,
+        PTE_R | PTE_X);
 
-    vm_mappages(kernel_pgtbl, (uint64)KERNEL_DATA, (uint64)KERNEL_DATA,
-        (uint64)ALLOC_END - (uint64)KERNEL_DATA, PTE_R | PTE_W);
+    vm_mappages(kernel_pgtbl,
+        (uint64)KERNEL_DATA,
+        (uint64)KERNEL_DATA,
+        (uint64)ALLOC_END - (uint64)KERNEL_DATA,
+        PTE_R | PTE_W
+    );
 
-    vm_mappages(kernel_pgtbl, TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
+    vm_mappages(kernel_pgtbl,
+        TRAMPOLINE,
+        (uint64)trampoline,
+        PGSIZE,
+        PTE_R | PTE_X
+    );
 
     for(int i = 0; i < N_PROC; ++i){
         void *kstack = pmem_alloc(true);

@@ -1,539 +1,498 @@
-# LAB-7: 文件系统 之 磁盘管理
+# LAB-7: 文件系统之磁盘管理
 
-**前言**
+## 实验目标
 
-本次实验我们将围绕磁盘管理构建文件系统的基础设施
+本次实验引入 VirtIO 虚拟磁盘，并建立文件系统最底层的块级管理能力。
 
-1. 首先讨论QEMU启动时的输入参数disk.img是如何构建的
+完成的功能包括：
 
-2. 随后讨论以block为基本单位的磁盘读写如何实现, 包括驱动本身+OS提供的配合
+- 使用 `mkfs` 构造包含超级块、inode 区域和 data 区域的磁盘镜像。
+- 在内核页表中映射 VirtIO MMIO 寄存器，并接通 PLIC 磁盘中断。
+- 建立以 4 KB block 为单位的 VirtIO 磁盘读写路径。
+- 实现带活跃/非活跃双链表和 LRU 规则的 buffer cache。
+- 实现 buffer 物理页的延迟申请与主动回收。
+- 读取并校验超级块，获得文件系统磁盘布局。
+- 实现 data bitmap 和 inode bitmap 的分配、释放与打印。
+- 增加 11 个用于测试 bitmap 和 buffer 的系统调用。
 
-3. 随后讨论磁盘与内存进行数据交换的桥梁--缓冲系统(buffer)
+## 磁盘镜像与布局
 
-4. 最后讨论磁盘上bitmap区域的管理方法
+QEMU 通过以下参数挂载 `disk.img`：
 
-## 代码组织结构
-
-```
-ECNU-OSLAB-2025-TASK
-├── LICENSE        开源协议
-├── .vscode        配置了可视化调试环境
-├── registers.xml  配置了可视化调试环境
-├── .gdbinit.tmp-riscv xv6自带的调试配置
-├── common.mk      Makefile中一些工具链的定义
-├── Makefile       编译运行整个项目 (CHANGE)
-├── kernel.ld      定义了内核程序在链接时的布局
-├── pictures       README使用的图片目录 (CHANGE, 日常更新)
-├── README.md      实验指导书 (CHANGE, 日常更新)
-└── src            源码
-    ├── kernel     内核源码
-    │   ├── arch   RISC-V相关
-    │   │   ├── method.h
-    │   │   ├── mod.h
-    │   │   └── type.h
-    │   ├── boot   机器启动
-    │   │   ├── entry.S
-    │   │   └── start.c
-    │   ├── lock   锁机制
-    │   │   ├── spinlock.c
-    │   │   ├── sleeplock.c
-    │   │   ├── method.h
-    │   │   ├── mod.h
-    │   │   └── type.h
-    │   ├── lib    常用库
-    │   │   ├── cpu.c
-    │   │   ├── print.c
-    │   │   ├── uart.c
-    │   │   ├── utils.c
-    │   │   ├── method.h
-    │   │   ├── mod.h
-    │   │   └── type.h
-    │   ├── mem    内存模块
-    │   │   ├── pmem.c
-    │   │   ├── kvm.c (TODO, 内核页表增加磁盘相关映射 + vm_getpte处理pgtbl为NULL的情况)
-    │   │   ├── uvm.c
-    │   │   ├── mmap.c
-    │   │   ├── method.h
-    │   │   ├── mod.h
-    │   │   └── type.h
-    │   ├── trap   陷阱模块
-    │   │   ├── plic.c (TODO, 增加磁盘中断相关支持)
-    │   │   ├── timer.c
-    │   │   ├── trap_kernel.c (TODO, 在外设处理函数中识别和响应磁盘中断)
-    │   │   ├── trap_user.c
-    │   │   ├── trap.S
-    │   │   ├── trampoline.S
-    │   │   ├── method.h
-    │   │   ├── mod.h (CHANGE, include 文件系统模块)
-    │   │   └── type.h
-    │   ├── proc   进程模块
-    │   │   ├── proc.c (在proc_return中调用文件系统初始化函数)
-    │   │   ├── swtch.S
-    │   │   ├── method.h
-    │   │   ├── mod.h (CHANGE, include 文件系统模块)
-    │   │   └── type.h
-    │   ├── syscall 系统调用模块
-    │   │   ├── syscall.c (TODO, 新增系统调用)
-    │   │   ├── sysfunc.c (TODO, 新增系统调用)
-    │   │   ├── method.h (CHANGE, 新增系统调用)
-    │   │   ├── mod.h (CHANGE, include文件系统模块)
-    │   │   └── type.h (CHANGE, 新增系统调用)
-    │   ├── fs     文件系统模块
-    │   │   ├── bitmap.c (TODO, bitmap相关操作)
-    │   │   ├── buffer.c (TODO, 内存中的block缓冲区管理)
-    │   │   ├── fs.c (TODO, 文件系统相关)
-    │   │   ├── virtio.c (NEW, 虚拟磁盘的驱动)
-    │   │   ├── method.h (NEW)
-    │   │   ├── mod.h (NEW)
-    │   │   └── type.h (NEW)
-    │   └── main.c (CHANGE, 增加virtio_init)
-    ├── mkfs       磁盘映像初始化
-    │   ├── mkfs.c (NEW)
-    │   └── mkfs.h (NEW)
-    └── user       用户程序
-        ├── initcode.c (CHANGE, 日常更新)
-        ├── sys.h
-        ├── syscall_arch.h
-        └── syscall_num.h (CHANGE, 日常更新)
+```makefile
+QEMUOPTS += -drive file=$(DISKIMG),if=none,format=raw,id=x0
+QEMUOPTS += -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
 ```
 
-**标记说明**
+`src/mkfs/mkfs.c` 是运行在宿主 Linux 上的格式化程序。它创建磁盘镜像、计算各区域位置，并将超级块写入磁盘第 0 块。磁盘布局为：
 
-**NEW**: 新增源文件, 直接拷贝即可, 无需修改
-
-**CHANGE**: 旧的源文件发生了更新, 直接拷贝即可, 无需修改
-
-**TODO**: 你需要实现新功能 / 你需要完善旧功能
-
-## 磁盘的初始状态--disk.img如何构建
-
-要引入磁盘这种新的外设肯定离不开QEMU的支持, 我们在**QEMUOPTS**增加了这样的两行:
-
-```
-QEMUOPTS += -drive file=$(DISKIMG),if=none,format=raw,id=x0 # 初始磁盘映像
-QEMUOPTS += -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 # 虚拟磁盘设备
+```text
+[ superblock | inode bitmap | inode region | data bitmap | data region ]
 ```
 
-它定义了磁盘在启动时的初始状态为disk.img, 同时启动了一个虚拟磁盘设备作为disk.img的载体
+本实验中 `BLOCK_SIZE` 与页大小相同，均为 4096 字节。一个 bitmap block 可以描述：
 
-**disk.img不是凭空产生的,它是如何构建的呢？**
+```text
+BIT_PER_BLOCK = 4096 * 8 = 32768 个资源
+```
 
-请你关注**mkfs/mkfs.c**和**mkfs/mkfs.h**源文件
+`inode_disk_t` 为 64 字节，因此每个 inode block 可以保存：
 
-简单来说, 它负责创建和打开一个文件, 并向这个文件写入一些信息进行文件系统格式化
+```text
+INODE_PER_BLOCK = 4096 / 64 = 64 个 inode
+```
 
-通过`open + lseek + write + close`这组常见的文件接口来实现 (注意, 它不是基于我们实现的内核, 而是Linux)
+根据 `N_INODE = 65536` 和 `N_DATA_BLOCK = 1310720`，最终布局如下：
 
-具体来说, 磁盘可以被看作以block为基本单位的长数组, **mkfs.h**规定了磁盘布局结构如下:
+| 区域 | 磁盘块范围 | 块数 | 作用 |
+|---|---:|---:|---|
+| superblock | 0 | 1 | 保存魔数、块大小和各区域位置 |
+| inode bitmap | 1 - 2 | 2 | 记录 65536 个 inode 是否分配 |
+| inode region | 3 - 1026 | 1024 | 保存磁盘 inode |
+| data bitmap | 1027 - 1066 | 40 | 记录 data block 是否分配 |
+| data region | 1067 - 1311786 | 1310720 | 保存文件数据及索引块 |
 
-**[ superblock | inode bitmap | inode region | data bitmap | data region ]**
-
-- block是磁盘的基本逻辑单位, 磁盘由若干block构成, block的大小规定为**BLOCK_SIZE**, 这里与**PAGE_SIZE**保持一致
-
-- 第1部分由**1个**block构成, 被称为超级块, 记录了文件系统和磁盘的相关信息(布局、魔数、块大小等), 是最重要的元数据
-
-- 第2、3部分描述文件系统元数据, 第4、5部分描述文件系统数据, 他们都是**element_bitmap + element_region**的结构
-
-- 第3部分包括N个inode, 第2部分描述第3部分各个inode元素是否分配出去了 (bit为1代表已分配, bit为0代表未分配)
-
-- 第5部分包括M个data block, 第4部分描述第5部分各个data block元素是否分配出去了 (bit为1代表已分配, bit为0代表未分配)
-
-通过修改**N_INODE**和**N_DATA_BLOCK**, 我们可以控制元数据资源池和数据资源池的大小, 进而影响disk.img的大小
-
-初始化结束后, disk.img中的**superblock**完成了设置, **inode bitmap**和**data bitmap**全部清零
-
-注意: 在本次实验中, 你只需要知道**inode region**是一个区别于**data region**的区域即可, 不需要对inode有细致了解
-
-## 构建block-level的读写能力
-
-构建disk.img后, 我们还需要构建读写它的基本能力, 才能实现数据的持久化存储
-
-前面提到过, 磁盘的基本管理单位是block, 因此我们首先考虑如何构建block-level的读写能力
-
-我们之前学习过另一种具备读写能力的外设--UART(串口), 可以获得以下启示:
-
-- 需要**磁盘驱动程序**, 通过一系列寄存器操作实现读写能力
-
-- 需要与OS的陷阱子系统密切配合, 实现中断响应函数 (磁盘操作很费时, 必须采用中断方式)
-
-**1. 首先讨论磁盘驱动程序的部分 (了解即可)**
-
-驱动程序非常复杂, 且和设备寄存器耦合严密, 不是学习的重点, 只需要知道它提供的接口即可
-
-请你查看**kernel/fs/virtio.c**源文件, 它包括以下几个函数:
+超级块是其他文件系统操作的定位依据。内核读取后会检查：
 
 ```c
-/* virtio.c: 以block为单位的磁盘读写能力 */
-
-void virtio_disk_init(); // 磁盘初始化
-void virtio_disk_rw(buffer_t *b, bool write); // 磁盘读写
-void virtio_disk_intr(); // 磁盘中断处理
+assert(sb.magic_num == FS_MAGIC,
+    "fs_init: invalid superblock");
+assert(sb.block_size == BLOCK_SIZE,
+    "fs_init: invalid block size");
 ```
 
-- `virtio_disk_init`与磁盘进行通信并让它进入READY状态
+魔数用于判断镜像是否属于当前文件系统格式，块大小检查则保证内核和 `mkfs` 对磁盘基本单位的理解一致。
 
-- `virtio_disk_rw`提供了以block为单位的读写能力, 供buffer子系统使用
+## VirtIO 磁盘接入
 
-- `virtio_disk_intr`是磁盘中断处理流程, 当磁盘完成一次I/O时会通过中断系统提醒OS, 唤醒等待磁盘资源的进程
+### MMIO 映射与地址翻译
 
-**2. 再讨论OS如何与磁盘驱动配合 (需要你做)**
-
-- 系统初始化(**main.c**): 在合适的位置增加虚拟磁盘初始化的逻辑
-
-- 内存系统(**pmem.c**): 需要在内核页表初始化时, 完成磁盘相关寄存器的映射工作
-
-- 内存系统(**pmem.c**): `virtion_disk_rw`中调用了`vm_getpte`进行地址翻译, 但是无法将页表参数设为内核页表(它是static的), 所以传入了NULL代表需要使用内核页表进行翻译, 需要修改`vm_getpte`来处理这种情况
-
-- 陷阱系统(**plic.c**): 使能磁盘中断并设置磁盘中断的优先级
-
-- 陷阱系统(**trap_kernel.c**): 在外设中断处理流程中增加磁盘中断的处理分支
-
-## 建立磁盘与内存的数据交换桥梁--缓冲系统 (buffer)
+VirtIO 设备寄存器从 `VIRTIO_BASE = 0x10001000` 开始。启用内核页表后，必须在 `kvm_init()` 中建立可读写的恒等映射：
 
 ```c
-/* 以Block为单位在内存和磁盘间传递数据 */
+vm_mappages(
+    kernel_pgtbl,
+    VIRTIO_BASE,
+    VIRTIO_BASE,
+    PGSIZE,
+    PTE_R | PTE_W
+);
+```
+
+VirtIO 描述符需要填写物理地址。驱动中的请求头 `buf0` 位于进程内核栈，而内核栈使用 `KSTACK(i)` 虚拟地址，不能直接作为 DMA 地址。因此 `virtio_disk_rw()` 使用：
+
+```c
+pte_t *pte = vm_getpte(NULL, addr, false);
+disk.desc[idx[0]].addr = (uint64)PTE_TO_PA(*pte) + off;
+```
+
+`kernel_pgtbl` 是 `kvm.c` 内部的静态变量，驱动无法直接取得它。本实验约定 `vm_getpte(NULL, ...)` 表示查询内核页表：
+
+```c
+if(pgtbl == NULL){
+    pgtbl = kernel_pgtbl;
+}
+```
+
+### PLIC 与磁盘中断
+
+VirtIO 磁盘使用中断号 `VIRTIO_IRQ = 1`。PLIC 初始化时同时设置 UART 和 VirtIO 的优先级，并在每个 hart 上使能两个中断源：
+
+```c
+*(uint32 *)(PLIC_PRIORITY(UART_IRQ)) = 1;
+*(uint32 *)(PLIC_PRIORITY(VIRTIO_IRQ)) = 1;
+
+*(uint32 *)PLIC_SENABLE(hartid) =
+    (1 << UART_IRQ) | (1 << VIRTIO_IRQ);
+```
+
+外设中断处理函数根据 `plic_claim()` 返回的 IRQ 分派处理：
+
+```c
+if(irq == UART_IRQ){
+    uart_intr();
+}else if(irq == VIRTIO_IRQ){
+    virtio_disk_intr();
+}
+
+if(irq)
+    plic_complete(irq);
+```
+
+一次磁盘请求的睡眠与唤醒路径为：
+
+```text
+进程提交 VirtIO 请求
+  -> 等待 buffer 完成并进入睡眠
+  -> 设备完成 I/O，向 PLIC 发送 IRQ 1
+  -> virtio_disk_intr() 确认设备中断
+  -> 清除 buffer->disk 并唤醒等待进程
+  -> plic_complete() 确认 PLIC 中断完成
+```
+
+设备自身的中断确认和 PLIC 的完成确认属于不同层次，两者都不能省略。
+
+## Buffer Cache
+
+### 数据结构与锁
+
+`buffer_t` 将一个磁盘块与一页内存绑定：
+
+```c
 typedef struct buffer {
-    /*
-        锁的说明:
-        1. block_num和ref由全局的自旋锁lk_buf_cache保护
-        2. data和disk由内部的睡眠锁slk保护
-    */
-    uint32 block_num;                // buffer对应的磁盘内block序号
-    uint32 ref;                      // 引用数 (该buffer被get的次数)
-    sleeplock_t slk;                 // 睡眠锁
-    uint8* data;                     // block数据(大小为BLOCK_SIZE)
-    bool disk;                       // 在virtio.c中使用
+    uint32 block_num;
+    uint32 ref;
+    sleeplock_t slk;
+    uint8 *data;
+    bool disk;
 } buffer_t;
 ```
 
-首先, 数据要从内存写入磁盘, 需要将内存缓冲区与磁盘中block的序号进行绑定, 指导`virtio_disk_rw`的工作
+字段由两类锁分别保护：
 
-因此, **buffer_t**需要包括**uint32 block_num**和**uint8* data**来记录这种绑定关系
+- 全局自旋锁 `lk_buf_cache` 保护 `block_num`、`ref` 和链表结构。
+- 每个 buffer 的睡眠锁 `slk` 保护 `data` 和磁盘 I/O 状态。
 
-此外, 磁盘是共享资源, 可能有多个进程同时访问一个block的情况
+`ref` 表示尚未由 `buffer_put()` 归还的引用数，包括当前持有睡眠锁的调用者和正在等待睡眠锁的调用者。它不是严格的进程数量。
 
-因此, 需要引入睡眠锁**slk**保证高效的有序访问, 引入计数器**ref**防止过早释放资源
+buffer 节点被组织为两个带头节点的双向循环链表：
 
-最后, 需要增加一个**disk**字段供**virtio.c**使用, 这里不做解释
-
-```c
-static buffer_node_t buf_cache[N_BUFFER];
-static buffer_node_t buf_head_active, buf_head_inactive;
-static spinlock_t lk_buf_cache;
+```text
+active:   ref > 0，正在使用或有人等待
+inactive: ref = 0，可以命中复用、淘汰或释放物理页
 ```
 
-类似之前**mmap**的管理方式, **buffer结构体资源**被组织为两个带头节点的双向循环链表
+每个链表中 `head->next` 表示较活跃的一端，`head->prev` 表示最不活跃的一端。
 
-**1. 资源初始化 (buffer_init)**
+### 初始化与延迟分配
 
-非活跃链表(以**buf_head_inactive**为头节点)中所有元素的ref都等于0 (无人引用)
-
-活跃链表(以**buf_head_inactive**为头节点)中所有元素的ref都大于0 (有人引用)
-
-因此, 在初始化时, buf_cache中所有buffer的ref设为0, block_num设为**BLOCK_NUM_UNUSED**
-
-随后, 将所有初始化的buffer插入非活跃链表 (我们希望第一个buffer最后位于buf_head_inactive->next)
-
-**2. 资源获取 (buffer_get)**
-
-buffer在链表间/链表内的移动遵守LRU原则: 最活跃的资源位于head->next, 最不活跃的资源位于head->prev
-
-![pic](./picture/LRU_get_operation.png)
-
-当上层尝试获取某个block对应的buffer时(如图片所示):
-
-- 我们首先尝试在活跃链表中寻找 (从head->next开始), 找到后将它移动到活跃链表的head->next
-
-- 如果找不到则尝试在不活跃链表中开始寻找 (从head->next开始), 找到后将它移动到活跃链表的head->next
-
-- 如果还是找不到, 说明缓存失败: 将系统中最不活跃的buffer拿出来, 设置block_num, 移动到活跃链表的head->prev
-
-如果buffer hit, 只需上锁后返回; 如果buffer miss, 上锁后需要先去磁盘中读入目标block
-
-注意: 通过buffer_get获取的buffer, 对应的ref应该+1, 记录被使用的次数
-
-**3. 资源释放 (buffer_put)**
-
-buffer释放时ref应该-1, 如果减到0, 则移动到不活跃链表的head->next
-
-![pic](./picture/LRU_put_operation.png)
-
-**4. 关于buffer控制的物理内存的申请和释放**
-
-我们按照自动申请, 手动释放的原则管理buffer控制的物理内存资源 (大小为BLOCK_SIZE, 与物理页一样大)
-
-具体来说:
-
-- 在`buf_get`获取不活跃链表中的元素时, 检查buf->data是否为NULL, 是的话申请一个物理页
-
-- 在`buf_freemem`中扫描不活跃链表中的若干最不活跃元素, 尝试释放buffer_count个物理页
-
-**5. 基于buffer的block读写**
-
-`buffer_read` 和 `buffer_write` 的底层都是 `virtio_disk_rw`
-
-只是在此基础上增加了睡眠锁检查, 确保调用者持有锁后才能进入耗时的磁盘操作
-
-**6. 典型的buffer使用方法**
+`buffer_init()` 初始化全局锁、两个空循环链表以及全部固定节点。所有节点最初进入非活跃链表：
 
 ```c
-/* 常规流程 */
-buffer_t* buf = buf_get(block_num);
-do_something_in_buf_data();
-buf_write(buf); // 也可以只读不修改
-buf_put(block_num);
-
-/* 一段时间后可能存在大量无用缓存 */
-buf_freemem(N_BUFFER);
-
+node->buf.block_num = BLOCK_NUM_UNUSED;
+node->buf.ref = 0;
+node->buf.data = NULL;
+node->buf.disk = false;
 ```
 
-## 使用buffer: 读入superblock
+`data = NULL` 表示节点尚未占用物理页。只有 `buffer_get()` 真正取得非活跃节点时才调用 `pmem_alloc(false)`，避免在初始化时一次性消耗最多 32 MB 物理内存。
 
-让我们来利用刚刚建立的缓冲系统做点重要的事情: 读入超级块
+### 获取与 LRU 移动
 
-**首先考虑读入的时机: 可以在main函数中完成吗?**
+`buffer_get(block_num)` 在持有全局自旋锁时分三种情况处理：
 
-不能, 因为磁盘读入会触发`proc_sleep`和`proc_wakeup`
+| 情况 | 处理 |
+|---|---|
+| active hit | `ref++`，移动到 active 的 `head->next`，然后等待睡眠锁 |
+| inactive hit | 取得空闲睡眠锁，`ref++`，移动到 active 的 `head->next` |
+| miss | 取 inactive 的 `head->prev`，绑定新块，移动到 active 的 `head->prev` |
 
-所以需要在用户进程的上下文中执行, 而不是在初始化过程中执行
+inactive hit 时，如果 `data == NULL`，说明块号元数据仍然命中，但物理页曾被回收，需要重新申请页面并从磁盘读入。cache miss 即使复用了已有物理页，也必须读取目标块，因为页面里保存的是旧块内容。
 
-**什么时刻是最早的时机呢?**
+磁盘 I/O 在释放 `lk_buf_cache` 后执行。VirtIO 等待过程可能调用 `proc_sleep()`，不能带着全局自旋锁睡眠。
 
-初始化过程中通过`proc_make_first`准备好了**proczero**, 并将它的context->ra设为`proc_return`
+### 归还与物理页回收
 
-之后初始化过程进入调度器逻辑(`proc_scheduler`), 将控制流切换到**proczero**
-
-因此, 最早的时机就是**proczero**第一次进入`proc_return`时!
-
-我们在这里调用`fs_init`进行文件系统初始化, 目前主要用于初始化缓冲系统和读入superblock
-
-考虑到debug的方便性, 请在读入superblock后输出磁盘布局信息 (通过`sb_print`)
-
-## 使用buffer: bitmap管理
-
-bitmap的管理以bit为基本粒度, 因此需要单独开辟一套管理逻辑
-
-- 当申请一个data block或inode时, 对应bitmap的某个bit被置为1
-
-- 当释放一个data block或inode时, 对应bitmap的对应bit被置为0
-
-请你基于buffer来实现以下函数:
+`buffer_put()` 先释放睡眠锁，再在全局锁保护下减少引用：
 
 ```c
-uint32 bitmap_alloc_block();
-uint32 bitmap_alloc_inode();
-void bitmap_free_block(uint32 block_num);
-void bitmap_free_inode(uint32 inode_num);
+sleeplock_release(&buf->slk);
+
+spinlock_acquire(&lk_buf_cache);
+buf->ref--;
+if(buf->ref == 0)
+    insert_node(node, false, true);
+spinlock_release(&lk_buf_cache);
 ```
 
-**它们的共同逻辑:**
+该顺序保证了一个重要不变量：
 
-- `bitmap_search_and_set`: 在1个bitmap_block中从头先后扫描bit流, 找到第一个为0的bit, 设置为1并返回索引号
-
-- `bitmap_clear`: 将bitmap_block中的某个bit设为0
-
-**需要注意的问题:**
-
-- bitmap区域可能横跨多个block, 寻找空闲bit时需要遍历
-
-- bitmap区域的最后一个block可能只用了一部分, 寻找空闲bit时需要传入有效范围
-
-- 细心一点, 可以通过逐字节遍历和逐bit位运算来寻找空闲bit
-
-## 增加系统调用
-
-我们需要增加以下11个系统调用的支持, 以支持后面的用户态测试用例
-
-```c
-#define SYS_alloc_block 11  // 从data_bitmap申请1个block (测试data_bitmap_alloc)
-#define SYS_free_block 12   // 向data_bitmap释放1个block (测试data_bitmap_free)
-#define SYS_alloc_inode 13  // 从inode_bitmap申请1个inode (测试inode_bitmap_alloc)
-#define SYS_free_inode 14   // 向inode_bitmap释放1个inode (测试inode_bitmap_free)
-#define SYS_show_bitmap 15  // 输出目标bitmap的状态
-#define SYS_get_block 16    // 获取1个描述block的buffer (测试buffer_get)
-#define SYS_read_block 17   // 将buf->data拷贝到用户空间
-#define SYS_write_block 18  // 基于用户地址空间更新buffer->data并写入磁盘 (测试buffer_write)
-#define SYS_put_block 19    // 释放1个描述block的buffer (测试buffer_put)
-#define SYS_show_buffer 20  // 输出buffer链表的状态
-#define SYS_flush_buffer 21 // 释放非活跃链表中buffer持有的物理内存资源 (测试buffer_freemem)
+```text
+只要 buffer 位于 inactive 链表，它的睡眠锁一定已经释放。
 ```
 
-请你结合**kernel/sycall/sysfunc.c**的注释和后面给出的测试用例来理解这些系统调用的输入输出
+`buffer_put()` 不会自动写磁盘，也不会释放 `data`。调用者修改数据后必须先调用 `buffer_write()`。物理页由 `buffer_freemem(count)` 单独回收：函数从 inactive 的最不活跃端向前扫描，释放至多 `count` 个非空 `data`，随后将指针设为 `NULL`。节点及其 `block_num` 仍被保留，因此以后仍可识别块号命中，但需要重新读盘。
 
-几乎都是先做参数读取, 然后调用对应的实现函数, 请你实现这些系统调用, 这里不做详细介绍
+## 文件系统初始化
 
-## 测试用例
-
-测试开始前, 请将**N_BUFFER**从(32 * 512)改成**N_BUFFER_TEST**, 方便测试
-
-测试用例包括三个部分:
-
-1. 什么都不做, 测试superblock信息能否正常输出, 检验磁盘和缓冲系统的基本能力
-
-2. 测试bitmap中资源申请和释放的正确性
-
-3. 测试缓冲系统的LRU管理逻辑是否生效
-
-**test-1**
+`fs_init()` 首先初始化 buffer cache，然后通过第 0 块读取超级块：
 
 ```c
-// test-1: read superblock
-#include "sys.h"
+buffer_init();
 
-int main()
-{
-	syscall(SYS_print_str, "hello, world!\n");
-	while(1);
+buffer_t *buf = buffer_get(FS_SB_BLOCK);
+memmove(&sb, buf->data, sizeof(sb));
+buffer_put(buf);
+```
+
+该逻辑不能直接放在 `main()` 中，因为 `buffer_get()` 可能等待磁盘中断并调用 `proc_sleep()`。此时必须已经存在当前进程和可运行的调度器。
+
+因此，文件系统在 `proczero` 第一次进入 `proc_return()` 时初始化：
+
+```c
+spinlock_release(&p->lk);
+
+if(p == proczero){
+    fs_init();
 }
 ```
 
-理想测试结果见`./picture/test-1.png`
+必须先释放进程锁，再执行可能睡眠的磁盘 I/O；同时通过 `p == proczero` 保证 buffer cache 和全局超级块只初始化一次。
 
-**test-2**
+## Bitmap 资源管理
+
+inode bitmap 和 data bitmap 都以一个 bit 描述一个资源：
+
+```text
+bit = 0：资源空闲
+bit = 1：资源已经分配或预留
+```
+
+bitmap 只描述分配状态，不记录资源属于哪个文件。后续文件系统通过 inode 的 `index[]` 建立文件与 data block 的关系。
+
+### 单块查找与修改
+
+对 bitmap 内第 `index` 个 bit：
 
 ```c
-// test-2: bitmap
-#include "sys.h"
+uint32 byte = index / BIT_PER_BYTE;
+uint32 shift = index % BIT_PER_BYTE;
+uint8 mask = (uint8)(1U << shift);
+```
 
+`bitmap_search_and_set()` 从前向后查找第一个为 0 的 bit，将其置 1、写回磁盘并返回块内索引。若当前 bitmap block 没有空闲位，则返回 `(uint32)-1`。
+
+`valid_count` 限定当前 bitmap block 中真正有效的 bit 数量。这样即使资源总数不是 `BIT_PER_BLOCK` 的整数倍，也不会把最后一块的填充 bit 当成真实资源。
+
+`bitmap_clear()` 在清零前断言目标 bit 原本为 1，可以检测重复释放。查找、修改和写回期间始终持有 bitmap buffer 的睡眠锁，因此多个进程不会同时分配到同一个 bit。
+
+### 资源编号换算
+
+data bitmap 中的 bit 描述 data region 内的相对位置，而分配接口返回全局磁盘块号：
+
+```text
+data block number =
+    sb.data_firstblock
+    + bitmap block offset * BIT_PER_BLOCK
+    + local bit index
+```
+
+释放时执行反向换算：
+
+```c
+uint32 relative = block_num - sb.data_firstblock;
+uint32 bitmap_block_num =
+    sb.data_bitmap_firstblock + relative / BIT_PER_BLOCK;
+uint32 local_index = relative % BIT_PER_BLOCK;
+```
+
+inode 编号本身从 0 开始，因此不需要加减 data region 起点：
+
+```text
+inode number = bitmap block offset * BIT_PER_BLOCK + local bit index
+```
+
+## 系统调用
+
+本实验新增 11 个系统调用：
+
+| 系统调用 | 作用 |
+|---|---|
+| `SYS_alloc_block` | 分配 data block |
+| `SYS_free_block` | 释放 data block |
+| `SYS_alloc_inode` | 分配 inode |
+| `SYS_free_inode` | 释放 inode |
+| `SYS_show_bitmap` | 输出 data 或 inode bitmap |
+| `SYS_get_block` | 获取指定磁盘块的 buffer |
+| `SYS_read_block` | 将 `buf->data` 复制到用户空间 |
+| `SYS_write_block` | 将用户数据复制到 buffer 并写回磁盘 |
+| `SYS_put_block` | 归还 buffer |
+| `SYS_show_buffer` | 输出 active/inactive 链表 |
+| `SYS_flush_buffer` | 回收非活跃 buffer 的物理页 |
+
+`SYS_get_block` 返回的是内核 `buffer_t` 指针。用户程序不能直接解引用它，只能把它作为不透明句柄传回其他系统调用。该设计用于本实验测试，完整系统应使用受内核校验的描述符代替暴露内核地址。
+
+用户地址只能结合当前进程页表解释。读取和写入系统调用的数据方向分别为：
+
+```text
+SYS_read_block:
+    kernel buf->data -> user addr_data
+    使用 uvm_copyout()
+
+SYS_write_block:
+    user addr_data -> kernel buf->data -> disk
+    使用 uvm_copyin() + buffer_write()
+```
+
+两种操作都要求当前进程仍持有该 buffer 的睡眠锁。
+
+## 测试结果
+
+测试时临时设置：
+
+```c
+#define N_BUFFER N_BUFFER_TEST
+```
+
+其中 `N_BUFFER_TEST = 8`，便于观察完整 LRU 链表。每组测试使用 `make -B run` 重新生成空白 bitmap 的磁盘镜像。测试结束后已恢复正式配置：
+
+```c
+#define N_BUFFER (32 * 512)
+```
+
+### 测试 1：超级块读取
+
+**测试目的：** 验证 VirtIO 磁盘是否能够完成初始化和中断驱动读盘，并检查内核能否通过 buffer cache 读取、校验和解析由 `mkfs` 写入的超级块。
+
+**测试过程：** 内核启动后，`proczero` 第一次进入 `proc_return()`，调用 `fs_init()` 初始化 buffer cache，并请求磁盘第 0 块。进程在等待 I/O 时睡眠，磁盘完成请求后通过 PLIC 中断将其唤醒。内核把第 0 块开头复制到全局 `sb`，检查魔数和块大小，输出五段磁盘布局。随后进入用户态并打印 `hello, world!`，用于确认文件系统初始化结束后仍能正常返回用户程序。
+
+核心测试代码：
+
+```c
+int main()
+{
+    syscall(SYS_print_str, "hello, world!\n");
+    while(1);
+}
+```
+
+![测试 1](picture/test1.png)
+
+**结果分析：** 两个 CPU 正常启动，随后内核成功输出超级块中的五段磁盘布局：inode bitmap 为 block 1 至 2，inode region 为 block 3 至 1026，data bitmap 为 block 1027 至 1066，data region 从 block 1067 开始。块大小为 4096 字节、inode 总数为 65536，与 `mkfs` 的计算一致。最后用户态打印 `hello, world!`，说明 VirtIO 初始化、MMIO 映射、PLIC 中断、磁盘睡眠/唤醒、buffer 读盘以及进入用户态的完整路径均已打通。
+
+### 测试 2：Bitmap 分配与释放
+
+**测试目的：** 验证 data bitmap 和 inode bitmap 的首次适配分配、编号换算、分批释放及磁盘持久化是否正确，并检查释放后的资源能否准确恢复为空闲状态。
+
+**测试过程：**
+
+1. 连续申请 20 个 data block，回收 bitmap buffer 的物理页后打印 data bitmap，检查分配结果是否从 data region 起点连续增长。
+2. 释放数组偶数下标对应的 10 个 data block，再次回收缓存并打印，检查剩余资源是否恰好为另一半。
+3. 释放其余 10 个 data block，确认 data bitmap 重新为空。
+4. 连续申请 20 个 inode，检查 inode 编号是否从 0 开始连续分配。
+5. 释放全部 inode 并确认 inode bitmap 为空。
+
+每个阶段主动执行 `SYS_flush_buffer`，使相关 buffer 的 `data` 物理页失效；随后的打印必须重新从磁盘读取 bitmap，因此还能同时验证修改是否真正写回磁盘。
+
+核心测试代码：
+
+```c
 #define NUM 20
-#define N_BUFFER 8
 
-int main()
-{
-	unsigned int block_num[NUM];
-	unsigned int inode_num[NUM];
+unsigned int block_num[NUM];
+unsigned int inode_num[NUM];
 
-	for (int i = 0; i < NUM; i++)
-		block_num[i] = syscall(SYS_alloc_block);
+for(int i = 0; i < NUM; i++)
+    block_num[i] = syscall(SYS_alloc_block);
 
-	syscall(SYS_flush_buffer, N_BUFFER);
-	syscall(SYS_show_bitmap, 0);
+syscall(SYS_flush_buffer, 8);
+syscall(SYS_show_bitmap, 0);
 
-	for (int i = 0; i < NUM; i+=2)
-		syscall(SYS_free_block, block_num[i]);
+for(int i = 0; i < NUM; i += 2)
+    syscall(SYS_free_block, block_num[i]);
 
-	syscall(SYS_flush_buffer, N_BUFFER);
-	syscall(SYS_show_bitmap, 0);
+syscall(SYS_flush_buffer, 8);
+syscall(SYS_show_bitmap, 0);
 
-	for (int i = 1; i < NUM; i+=2)
-		syscall(SYS_free_block, block_num[i]);
+for(int i = 1; i < NUM; i += 2)
+    syscall(SYS_free_block, block_num[i]);
 
-	syscall(SYS_flush_buffer, N_BUFFER);
-	syscall(SYS_show_bitmap, 0);
+syscall(SYS_flush_buffer, 8);
+syscall(SYS_show_bitmap, 0);
 
-	for (int i = 0; i < NUM; i++)
-		inode_num[i] = syscall(SYS_alloc_inode);
+for(int i = 0; i < NUM; i++)
+    inode_num[i] = syscall(SYS_alloc_inode);
 
-	syscall(SYS_flush_buffer, N_BUFFER);
-	syscall(SYS_show_bitmap, 1);
+syscall(SYS_flush_buffer, 8);
+syscall(SYS_show_bitmap, 1);
 
-	for (int i = 0; i < NUM; i++)
-		syscall(SYS_free_inode, inode_num[i]);
+for(int i = 0; i < NUM; i++)
+    syscall(SYS_free_inode, inode_num[i]);
 
-	syscall(SYS_flush_buffer, N_BUFFER);
-	syscall(SYS_show_bitmap, 1);
-
-	while(1);
-}
+syscall(SYS_flush_buffer, 8);
+syscall(SYS_show_bitmap, 1);
 ```
 
-理想测试结果见`./picture/test-2.png`
+![测试 2](picture/test2.png)
 
-**test-3**
+**结果分析：** 第一次输出为 data block 1067 至 1086，说明分配器从 data region 起点连续选择前 20 个空闲 bit，并正确换算为全局磁盘块号。释放数组偶数下标后只剩 1068、1070 至 1086，随后释放奇数下标后 bitmap 为空。inode 分配从编号 0 开始得到 0 至 19，全部释放后同样为空。每次打印前回收 buffer 物理页仍能得到正确结果，说明 bitmap 的修改已经通过 `buffer_write()` 持久化到磁盘，而不是只存在于内存缓存。
+
+### 测试 3：Buffer 读写、LRU 与回收
+
+**测试目的：** 验证 buffer cache 的块级读写、磁盘持久化、active/inactive 链表迁移、引用计数、LRU 顺序及非活跃物理页回收逻辑。
+
+**测试过程：**
+
+1. 在 state-1 输出初始化后的缓存状态，观察超级块 buffer 是否已经归还到 inactive 链表。
+2. 获取 block 5000，将 `ABCDEFGH` 写入其 buffer 并同步到磁盘，归还后输出 state-2。
+3. 释放全部非活跃 buffer 的物理页，再次获取 block 5000 并读入另一个用户数组；比较写入和读出字符串，并输出 state-3，验证数据来自磁盘而不是旧内存副本。
+4. 按 5000、5003、5007、5002、5004 的顺序获取五个 buffer 且暂不归还，输出 state-4，观察 active 链表和 `ref = 1`。
+5. 依次归还 5007、5000、5004，输出 state-5，检查这三个节点进入 inactive 头部，而 5003、5002 继续保持 active。
+6. 调用 `SYS_flush_buffer(3)`，输出 state-6，检查三个最不活跃且持有物理页的 buffer 是否仅将 `data` 释放为 0，同时保留块号和链表位置。
+
+核心测试代码：
 
 ```c
-#include "sys.h"
-
 #define PGSIZE 4096
-#define N_BUFFER 8
 #define BLOCK_BASE 5000
 
-int main()
-{
-	char data[PGSIZE], tmp[PGSIZE];
-	unsigned long long buffer[N_BUFFER];
+char data[PGSIZE], tmp[PGSIZE];
+unsigned long long buffer[8];
 
-	/*-------------一阶段测试: READ WRITE------------- */
+for(int i = 0; i < 8; i++)
+    data[i] = 'A' + i;
+data[8] = '\n';
+data[9] = '\0';
 
-	/* 准备字符串"ABCDEFGH" */
-	for (int i = 0; i < 8; i++)
-		data[i] = 'A' + i;
-	data[8] = '\n';
-	data[9] = '\0';
+buffer[0] = syscall(SYS_get_block, BLOCK_BASE);
+syscall(SYS_write_block, buffer[0], data);
+syscall(SYS_put_block, buffer[0]);
 
-	/* 查看此时的buffer_cache状态 */
-	syscall(SYS_print_str, "\nstate-1 ");
-	syscall(SYS_show_buffer);
+syscall(SYS_flush_buffer, 8);
 
-	/* 向BLOCK_BASE写入字符 */
-	buffer[0] = syscall(SYS_get_block, BLOCK_BASE);
-	syscall(SYS_write_block, buffer[0], data);
-	syscall(SYS_put_block, buffer[0]);
+buffer[0] = syscall(SYS_get_block, BLOCK_BASE);
+syscall(SYS_read_block, buffer[0], tmp);
+syscall(SYS_put_block, buffer[0]);
 
-	/* 查看此时的buffer_cache状态 */
-	syscall(SYS_print_str, "\nstate-2 ");
-	syscall(SYS_show_buffer);
+buffer[0] = syscall(SYS_get_block, BLOCK_BASE);
+buffer[3] = syscall(SYS_get_block, BLOCK_BASE + 3);
+buffer[7] = syscall(SYS_get_block, BLOCK_BASE + 7);
+buffer[2] = syscall(SYS_get_block, BLOCK_BASE + 2);
+buffer[4] = syscall(SYS_get_block, BLOCK_BASE + 4);
 
-	/* 清空内存副本, 确保后面从磁盘中重新读取 */
-	syscall(SYS_flush_buffer, N_BUFFER);
+syscall(SYS_put_block, buffer[7]);
+syscall(SYS_put_block, buffer[0]);
+syscall(SYS_put_block, buffer[4]);
 
-	/* 读取BLOCK_BASE*/
-	buffer[0] = syscall(SYS_get_block, BLOCK_BASE);
-	syscall(SYS_read_block, buffer[0], tmp);
-	syscall(SYS_put_block, buffer[0]);
-
-	/* 比较写入的字符串和读到的字符串 */
-	syscall(SYS_print_str, "\n");
-	syscall(SYS_print_str, "write data: ");
-	syscall(SYS_print_str, data);
-	syscall(SYS_print_str, "read data: ");
-	syscall(SYS_print_str, tmp);
-
-	/* 查看此时的buffer_cache状态 */
-	syscall(SYS_print_str, "\nstate-3 ");
-	syscall(SYS_show_buffer);
-
-	/*-------------二阶段测试: GET PUT FLUSH------------- */
-
-	/* GET */
-	buffer[0] = syscall(SYS_get_block, BLOCK_BASE);
-	buffer[3] = syscall(SYS_get_block, BLOCK_BASE + 3);
-	buffer[7] = syscall(SYS_get_block, BLOCK_BASE + 7);
-	buffer[2] = syscall(SYS_get_block, BLOCK_BASE + 2);
-	buffer[4] = syscall(SYS_get_block, BLOCK_BASE + 4);
-
-	/* 查看此时的buffer_cache状态 */
-	syscall(SYS_print_str, "\nstate-4 ");
-	syscall(SYS_show_buffer);
-
-	/* PUT */
-	syscall(SYS_put_block, buffer[7]);
-	syscall(SYS_put_block, buffer[0]);
-	syscall(SYS_put_block, buffer[4]);
-
-	/* 查看此时的buffer_cache状态 */
-	syscall(SYS_print_str, "\nstate-5 ");
-	syscall(SYS_show_buffer);
-
-	/* FLUSH */
-	syscall(SYS_flush_buffer, 3);
-
-	/* 查看此时的buffer_cache状态 */
-	syscall(SYS_print_str, "\nstate-6 ");
-	syscall(SYS_show_buffer);
-
-	while(1);
-}
+syscall(SYS_flush_buffer, 3);
 ```
-理想测试结果见`./picture/test-3(1).png`和`./picture/test-3(2).png`
 
-**尾声**
+![测试 3-1](<picture/test3(1).png>)
 
-本次实验只是第三阶段的热身和铺垫~
+![测试 3-2](<picture/test3(2).png>)
 
-我们引入了磁盘这种外设并具备了block-level的管理能力
+![测试 3-3](<picture/test3(3).png>)
 
-在lab-8中, 我们要用inode将block组织起来并构建层次化的数据存储系统
+**结果分析：**
 
-我们即将进入真正的文件系统逻辑, 请你做好准备迎接新的挑战!
+- state-1 中 active 为空，读取超级块使用的 buffer 7 位于 inactive 头部并绑定 block 0，说明 `fs_init()` 已正确归还超级块 buffer。
+- state-2 中 block 5000 绑定到 buffer 6。写入后执行 `buffer_put()`，因此该节点进入 inactive 头部。
+- 清空内存缓存后重新读取 block 5000，输出的 `write data` 和 `read data` 都是 `ABCDEFGH`，说明数据已经写入磁盘，并能在 `data == NULL` 时重新申请物理页读回。
+- state-4 中 active 顺序为 5000、5003、5007、5002、5004，五个节点的 `ref` 均为 1，与测试中的 GET 顺序及 miss 插入规则一致。
+- 归还 block 5007、5000、5004 后，state-5 只保留 5003 和 5002 在 active 链表；inactive 头部依次为 5004、5000、5007，符合 `buffer_put()` 将最新归还节点插入 `head->next` 的规则。
+- state-6 中 active 链表保持不变，inactive 中 5004、5000、5007 对应的三个物理页地址变为 0，而块号仍然保留。这验证了 `buffer_freemem(3)` 只回收最不活跃的可释放物理页，不破坏节点和块号元数据。
+
+## 总结
+
+本次实验完成了从“内核只有内存资源”到“能够异步访问持久化块设备”的扩展。VirtIO 驱动负责设备协议，内核页表和 PLIC 提供寄存器访问及中断入口，buffer cache 在磁盘与内存之间提供互斥、缓存和生命周期管理，bitmap 则在其上实现持久化资源分配。
+
+关键结论如下：
+
+- MMIO 地址在启用页表后也必须建立显式映射，设备 DMA 使用物理地址而不是任意内核虚拟地址。
+- 磁盘 I/O 可能睡眠，因此不能在初始化主流程或持有自旋锁时等待设备完成。
+- buffer 的 `ref` 保护节点生命周期，睡眠锁保护块数据，两者不能互相替代。
+- active/inactive 双链表同时表达“是否正在引用”和 LRU 活跃程度，使缓存命中、淘汰与物理页回收可以统一管理。
+- bitmap 的 bit 是持久化的资源分配状态；通过 buffer 睡眠锁包围检查、修改和写回，可以避免并发重复分配。
+- 用户指针必须通过用户页表和 `uvm_copyin/out()` 解释，不能在内核中直接解引用。
+
+最终代码通过 `make -B build` 完整构建，并通过超级块读取、bitmap 分配释放以及 buffer 持久化/LRU/回收三组测试。

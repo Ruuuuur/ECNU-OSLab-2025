@@ -223,7 +223,12 @@ uint64 sys_getpid()
 */
 uint64 sys_alloc_block()
 {
+    uint32 block_num = bitmap_alloc_block();
 
+    if(block_num == (uint32)-1)
+        return -1;
+
+    return block_num;
 }
 
 /*
@@ -232,7 +237,11 @@ uint64 sys_alloc_block()
 */
 uint64 sys_free_block()
 {
+    uint32 block_num;
+    arg_uint32(0, &block_num);
 
+    bitmap_free_block(block_num);
+    return 0;
 }
 
 /*
@@ -241,7 +250,12 @@ uint64 sys_free_block()
 */
 uint64 sys_alloc_inode()
 {
+    uint32 inode_num = bitmap_alloc_inode();
 
+    if(inode_num == (uint32)-1)
+        return -1;
+
+    return inode_num;
 }
 
 /*
@@ -250,7 +264,11 @@ uint64 sys_alloc_inode()
 */
 uint64 sys_free_inode()
 {
+    uint32 inode_num;
+    arg_uint32(0, &inode_num);
 
+    bitmap_free_inode(inode_num);
+    return 0;
 }
 
 /*
@@ -259,7 +277,14 @@ uint64 sys_free_inode()
 */
 uint64 sys_show_bitmap()
 {
+    uint32 choose_bitmap;
+    arg_uint32(0, &choose_bitmap);
 
+    if(choose_bitmap > 1)
+        return -1;
+
+    bitmap_print(choose_bitmap == 0);
+    return 0;
 }
 
 /*
@@ -268,7 +293,10 @@ uint64 sys_show_bitmap()
 */
 uint64 sys_get_block()
 {
+    uint32 block_num;
+    arg_uint32(0, &block_num);
 
+    return (uint64)buffer_get(block_num);
 }
 
 /*
@@ -277,7 +305,11 @@ uint64 sys_get_block()
 */
 uint64 sys_put_block()
 {
+    uint64 addr_buf;
+    arg_uint64(0, &addr_buf);
 
+    buffer_put((buffer_t *)addr_buf);
+    return 0;
 }
 
 /*
@@ -287,7 +319,25 @@ uint64 sys_put_block()
 */
 uint64 sys_read_block()
 {
+    uint64 addr_buf, addr_data;
+    arg_uint64(0, &addr_buf);
+    arg_uint64(1, &addr_data);
 
+    buffer_t *buf = (buffer_t *)addr_buf;
+    proc_t *p = myproc();
+
+    assert(buf != NULL, "sys_read_block: buf is NULL");
+    assert(sleeplock_holding(&buf->slk),
+        "sys_read_block: buffer not locked");
+
+    uvm_copyout(
+        p->pgtbl,
+        addr_data,
+        (uint64)buf->data,
+        BLOCK_SIZE
+    );
+
+    return 0;
 }
 
 /*
@@ -297,17 +347,40 @@ uint64 sys_read_block()
 */
 uint64 sys_write_block()
 {
+    uint64 addr_buf, addr_data;
+    arg_uint64(0, &addr_buf);
+    arg_uint64(1, &addr_data);
 
+    buffer_t *buf = (buffer_t *)addr_buf;
+    proc_t *p = myproc();
+
+    assert(buf != NULL, "sys_write_block: buf is NULL");
+    assert(sleeplock_holding(&buf->slk),
+        "sys_write_block: buffer not locked");
+
+    uvm_copyin(
+        p->pgtbl,
+        (uint64)buf->data,
+        addr_data,
+        BLOCK_SIZE
+    );
+
+    buffer_write(buf);
+    return 0;
 }
 
 /* 输出 buffer 链表状态 */
 uint64 sys_show_buffer()
 {
-
+    buffer_print_info();
+    return 0;
 }
 
 /* 释放非活跃 buffer 持有的物理页 */
 uint64 sys_flush_buffer()
 {
+    uint32 buffer_count;
+    arg_uint32(0, &buffer_count);
 
+    return buffer_freemem(buffer_count);
 }

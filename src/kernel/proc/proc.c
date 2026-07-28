@@ -1,5 +1,7 @@
 #include "mod.h"
 #include "../../user/initcode.h"
+#include "../fs/type.h"
+#include "../fs/method.h"
 
 #define initcode target_user_initcode
 #define initcode_len target_user_initcode_len
@@ -45,6 +47,11 @@ static void proc_return()
         "proc_return: process lock is not held");
 
     spinlock_release(&p->lk);
+
+    if(p == proczero){
+        fs_init();
+    }
+
     trap_user_return();
 
     panic("proc_return: trap_user_return returned");
