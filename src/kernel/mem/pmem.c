@@ -10,7 +10,9 @@ static void alloc_region_init(alloc_region_t *ar, char *name, uint64 begin, uint
     ar->allocable = 0;
     ar->list_head.next = NULL;
 
-    for(uint64 p = begin; p < end; p += PGSIZE){
+    /* 反向遍历并头插，使后续分配按物理地址递增。 */
+    for(uint64 p = end; p > begin;){
+        p -= PGSIZE;
         page_node_t *node = (page_node_t *)p;
         node->next = ar->list_head.next;
         ar->list_head.next = node;

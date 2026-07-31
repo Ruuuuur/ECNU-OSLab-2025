@@ -24,16 +24,16 @@ void fs_init()
 {
 	buffer_init();
 
-    buffer_t *buf = buffer_get(FS_SB_BLOCK);
+	buffer_t *buf = buffer_get(FS_SB_BLOCK);
 
-    memmove(&sb, buf->data, sizeof(sb));
+	memmove(&sb, buf->data, sizeof(sb));
 
-    buffer_put(buf);
+	buffer_put(buf);
 
-    assert(sb.magic_num == FS_MAGIC,
-        "fs_init: invalid superblock");
-    assert(sb.block_size == BLOCK_SIZE,
-        "fs_init: invalid block size");
+	assert(sb.magic_num == FS_MAGIC,
+		"fs_init: invalid superblock");
+	assert(sb.block_size == BLOCK_SIZE,
+		"fs_init: invalid block size");
 
-    sb_print();
+	sb_print();
 }
