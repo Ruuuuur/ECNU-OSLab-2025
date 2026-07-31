@@ -115,6 +115,8 @@ void trap_kernel_handler()
             panic("trap_kernel_handler");
         }
     }
+    w_sepc(sepc);
+    w_sstatus(sstatus);
 }
 
 // 外设中断处理 (基于PLIC，lab-3只需要识别和处理UART中断)
