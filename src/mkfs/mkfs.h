@@ -56,7 +56,7 @@ typedef struct super_block {
 
 /*
 	关于单个文件的最大容量:
-
+	
 	基于addrs进行计算, 单个文件最大可达 4GB + 8MB + 40KB
 	1. 10 * 4KB = 40KB
 	2. 2 * (4KB / 4B) * 4KB = 8MB
@@ -101,4 +101,8 @@ typedef struct dentry {
 #define BIT_PER_BLOCK     (BLOCK_SIZE * BIT_PER_BYTE)
 #define INODE_PER_BLOCK   (BLOCK_SIZE / sizeof(inode_disk_t))
 #define DENTRY_PER_BLOCK  (BLOCK_SIZE / sizeof(dentry_t))
-#define COUNT_BLOCKS(ele_num, ele_per_block)  (((ele_num) + (ele_per_block) - 1) / (ele_per_block))
+#define COUNT_BLOCKS(ele_num, ele_per_block)  (((ele_num) + (ele_per_block) - 1) / (ele_per_block)) 
+
+// 输入参数限制
+#define ELF_MAXARGS          32
+#define ELF_MAXARG_LEN       (4096 / ELF_MAXARGS)

@@ -66,15 +66,8 @@ void uart_intr(void)
 	{
 		int c = uart_getc_sync();
 		if (c == -1)
-			break;
-		if(c == '\r'){
-			uart_putc_sync('\n');
-		}else if(c == '\b' || c == 0x7f){
-			uart_putc_sync('\b');
-			uart_putc_sync(' ');
-			uart_putc_sync('\b');
-		}else{
-			uart_putc_sync(c);
-		}
+		break;
+
+		cons_edit(c);
 	}
 }
