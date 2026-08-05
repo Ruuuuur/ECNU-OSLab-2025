@@ -369,7 +369,7 @@ uint64 uvm_heap_grow(pgtbl_t pgtbl, uint64 cur_heap_top, uint32 len, int flag)
             va,
             (uint64)page,
             PGSIZE,
-            PTE_R | PTE_W | PTE_U
+            flag | PTE_U
         );
     }
     return new_heap_top;

@@ -78,5 +78,16 @@ void pmem_free(uint64 page, bool in_kernel)
 // 获取可用内存信息
 void pmem_stat(uint32 *free_pages_in_kernel, uint32 *free_pages_in_user)
 {
+    assert(free_pages_in_kernel != NULL,
+    "pmem_stat: kernel output is NULL");
+    assert(free_pages_in_user != NULL,
+        "pmem_stat: user output is NULL");
 
+    spinlock_acquire(&kern_region.lk);
+    *free_pages_in_kernel = kern_region.allocable;
+    spinlock_release(&kern_region.lk);
+
+    spinlock_acquire(&user_region.lk);
+    *free_pages_in_user = user_region.allocable;
+    spinlock_release(&user_region.lk);
 }

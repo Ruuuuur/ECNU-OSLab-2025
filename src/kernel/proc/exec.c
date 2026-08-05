@@ -1,4 +1,6 @@
 #include "mod.h"
+#include "../fs/type.h"
+#include "../fs/method.h"
 
 /*
 	将ELF文件中的segment放入内存中制定位置
@@ -52,9 +54,27 @@ static uint64 prepare_heap(pgtbl_t new_pgtbl, inode_t *ip, elf_header_t *eh)
 		if (ph.va % PGSIZE != 0)
 			return -1;
 		
+		int pte_flags = 0;
+
+		if (ph.flags & ELF_PROG_FLAG_READ)
+			pte_flags |= PTE_R;
+
+		if (ph.flags & ELF_PROG_FLAG_WRITE)
+			pte_flags |= PTE_R | PTE_W;
+
+		if (ph.flags & ELF_PROG_FLAG_EXEC)
+			pte_flags |= PTE_X;
+
+		if (pte_flags == 0)
+			return -1;
+
 		// 用户堆生长
-		new_heap_top = uvm_heap_grow(new_pgtbl, old_heap_top,
-						ph.va + ph.mem_size - old_heap_top, PTE_R | PTE_X);
+		new_heap_top = uvm_heap_grow(
+						new_pgtbl,
+						old_heap_top,
+						ph.va + ph.mem_size - old_heap_top,
+						pte_flags
+					);
 		if (new_heap_top != ph.va + ph.mem_size)
 			return -1;
 		old_heap_top = new_heap_top;
@@ -112,5 +132,127 @@ static uint64 prepare_stack(pgtbl_t new_pgtbl, char **argv, int *arg_count)
 */
 int proc_exec(char *path, char **argv)
 {
-	
+	if (path == NULL || path[0] == '\0' ||
+        argv == NULL)
+        return -1;
+
+    proc_t *p = myproc();
+    if (p == NULL)
+        return -1;
+
+    /*
+     * 先构造全新的地址空间。失败时旧进程仍可继续运行。
+     */
+    trapframe_t *new_tf =
+        (trapframe_t *)pmem_alloc(true);
+
+    pgtbl_t new_pgtbl =
+        proc_pgtbl_init((uint64)new_tf);
+
+    inode_t *ip = path_to_inode(path);
+    if (ip == NULL)
+        goto fail;
+
+    elf_header_t eh;
+    inode_lock(ip);
+
+    /*
+     * 检查文件类型和ELF头。
+     */
+    if (ip->disk_info.type != INODE_TYPE_DATA ||
+        inode_read_data(
+            ip, 0, sizeof(eh), &eh, false
+        ) != sizeof(eh) ||
+        eh.magic != ELF_MAGIC ||
+        eh.eh_size != sizeof(elf_header_t) ||
+        eh.ph_ent_size != sizeof(program_header_t)) {
+        goto fail_inode;
+    }
+
+    /*
+     * program header table必须完整位于文件内。
+     */
+    uint64 ph_table_size =
+        (uint64)eh.ph_ent_num *
+        sizeof(program_header_t);
+
+    if (eh.ph_off > ip->disk_info.size ||
+        ph_table_size >
+            ip->disk_info.size - eh.ph_off) {
+        goto fail_inode;
+    }
+
+    uint64 new_heap_top =
+        prepare_heap(new_pgtbl, ip, &eh);
+
+    if (new_heap_top == (uint64)-1 ||
+        eh.entry < USER_BASE ||
+        eh.entry >= new_heap_top) {
+        goto fail_inode;
+    }
+
+    inode_unlock(ip);
+    inode_put(ip);
+    ip = NULL;
+
+    int argc = 0;
+    uint64 new_sp =
+        prepare_stack(new_pgtbl, argv, &argc);
+
+    if (new_sp == (uint64)-1)
+        goto fail;
+
+    /*
+     * 新地址空间已经完整构造，开始提交。
+     */
+    pgtbl_t old_pgtbl = p->pgtbl;
+    mmap_region_t *old_mmap = p->mmap;
+
+    new_tf->a0 = argc;
+    new_tf->a1 = new_sp;
+    new_tf->user_to_kern_epc = eh.entry;
+    new_tf->sp = new_sp;
+
+    p->pgtbl = new_pgtbl;
+    p->tf = new_tf;
+    p->heap_top = new_heap_top;
+    p->ustack_npage = 1;
+    p->mmap = NULL;
+
+    /*
+     * 使用路径最后一个分量作为进程名。
+     */
+    char *base = path;
+
+    for (char *s = path; *s != '\0'; s++) {
+        if (*s == '/' && s[1] != '\0')
+            base = s + 1;
+    }
+
+    uint32 name_len = strlen(base);
+    name_len = MIN(name_len, PROC_NAME_LEN - 1);
+
+    memset(p->name, 0, sizeof(p->name));
+    memmove(p->name, base, name_len);
+
+    /*
+     * 新地址空间提交后，才能销毁旧地址空间。
+     */
+    uvm_destroy_pgtbl(old_pgtbl);
+
+    while (old_mmap != NULL) {
+        mmap_region_t *next = old_mmap->next;
+        mmap_region_free(old_mmap);
+        old_mmap = next;
+    }
+
+    return argc;
+
+fail_inode:
+    inode_unlock(ip);
+    inode_put(ip);
+
+fail:
+    uvm_destroy_pgtbl(new_pgtbl);
+    return -1;
 }

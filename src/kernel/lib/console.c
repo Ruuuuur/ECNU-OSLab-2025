@@ -1,4 +1,6 @@
 #include "mod.h"
+#include "../mem/mod.h"
+#include "../proc/method.h"
 
 #define BACKSPACE 0x100
 #define Ctrl(x) ((x)-'@')

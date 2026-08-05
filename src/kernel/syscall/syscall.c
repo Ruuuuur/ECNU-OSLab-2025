@@ -10,7 +10,20 @@ static uint64 (*syscalls[])(void) = {
     [SYS_exit] sys_exit,
     [SYS_sleep] sys_sleep,
     [SYS_getpid] sys_getpid,
-
+    [SYS_exec] sys_exec,
+    [SYS_open] sys_open,
+    [SYS_close] sys_close,
+    [SYS_read] sys_read,
+    [SYS_write] sys_write,
+    [SYS_lseek] sys_lseek,
+    [SYS_dup] sys_dup,
+    [SYS_fstat] sys_fstat,
+    [SYS_get_dentries] sys_get_dentries,
+    [SYS_mkdir] sys_mkdir,
+    [SYS_chdir] sys_chdir,
+    [SYS_print_cwd] sys_print_cwd,
+    [SYS_link] sys_link,
+    [SYS_unlink] sys_unlink,
 };
 
 // 基于系统调用表的请求跳转
@@ -23,7 +36,14 @@ void syscall()
         printf("unknown syscall %d from pid = %d\n", sys_num, p->pid);
         panic("syscall");
     } else {
-        p->tf->a0 = syscalls[sys_num]();
+        /*
+        * sys_exec可能替换并释放旧trapframe，
+        * 因此先完成调用，再重新取得当前trapframe。
+        */
+        uint64 result = syscalls[sys_num]();
+
+        p = myproc();
+        p->tf->a0 = result;
     }
 }
 

@@ -49,7 +49,29 @@ static void proc_return()
     spinlock_release(&p->lk);
 
     if(p == proczero){
+        /*
+        * 文件系统初始化完成后，才能取得根inode并打开设备文件。
+        */
         fs_init();
+
+        p->cwd = inode_get(ROOT_INODE);
+
+        p->open_file[0] =
+            file_open("/dev/stdin", FILE_OPEN_READ);
+
+        p->open_file[1] =
+            file_open("/dev/stdout", FILE_OPEN_WRITE);
+
+        p->open_file[2] =
+            file_open("/dev/stderr", FILE_OPEN_WRITE);
+
+        assert(
+            p->cwd != NULL &&
+            p->open_file[0] != NULL &&
+            p->open_file[1] != NULL &&
+            p->open_file[2] != NULL,
+            "proc_return: initialize files failed"
+        );
     }
 
     trap_user_return();
@@ -130,6 +152,25 @@ void proc_free(proc_t *p)
     assert(p->state != UNUSED,
         "proc_free: process already unused");
 
+    /*
+    * 归还进程持有的所有打开文件。
+    */
+    for (uint32 i = 0;
+        i < N_OPEN_FILE_PER_PROC;
+        i++) {
+        if (p->open_file[i] != NULL) {
+            file_close(p->open_file[i]);
+            p->open_file[i] = NULL;
+        }
+    }
+
+    /*
+    * 归还当前工作目录的inode引用。
+    */
+    if (p->cwd != NULL) {
+        inode_put(p->cwd);
+        p->cwd = NULL;
+    }
     /*
      * 释放用户页、trapframe 和三级页表。
      * trampoline 只解除映射，不释放共享物理页。
@@ -278,6 +319,27 @@ int proc_fork()
 
     memmove(child->name, parent->name, sizeof(child->name));
 
+    /*
+    * 子进程继承父进程的当前工作目录。
+    */
+    assert(parent->cwd != NULL,
+        "proc_fork: parent cwd is NULL");
+
+    child->cwd = inode_dup(parent->cwd);
+
+    /*
+    * 子进程继承父进程已经打开的文件。
+    */
+    for (uint32 i = 0;
+        i < N_OPEN_FILE_PER_PROC;
+        i++) {
+        if (parent->open_file[i] != NULL) {
+            child->open_file[i] =
+                file_dup(parent->open_file[i]);
+        } else {
+            child->open_file[i] = NULL;
+        }
+    }
     // 深拷贝 mmap 描述符链表
     mmap_region_t *last = NULL;
 
